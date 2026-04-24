@@ -1,5 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/*
+ * custom_crashdump_nmi.c - Custom crash dump via NMI, panic notifier, and vmcoredd
+ *
+ * This driver captures per-CPU register state and printk tail at panic time and
+ * embeds the result as a device dump (vmcoredd) blob in /proc/vmcore, where the
+ * capture tool (show_vmcoredd.py) can extract and decode it from the 2nd kernel.
+ *
+ * Flow (1st kernel):
+ *   NMI                -> custom_nmi_handler()           : per-CPU register snapshot
+ *   panic() notifier   -> custom_crashdump_capture()     : collect all CPUs + printk tail
+ *   crash_save_vmcoreinfo() -> custom_vmcoreinfo_extra_append() : write keys to ELF note
+ *
+ * Flow (2nd / kdump kernel):
+ *   late_initcall      -> custom_vmcoredd_late_init()    : read vmcoreinfo from old mem,
+ *                         custom_vmcoredd_register()       register blob with vmcore layer
+ *   /proc/vmcore read  -> custom_vmcoredd_copy_from_oldmem() : stream blob to user space
+ */
+
 #include <linux/atomic.h>
 #include <linux/cc_platform.h>
 #include <linux/cpu.h>
@@ -43,6 +61,11 @@
 #define CUSTOM_VMCOREDD_MAX_CPUS    256
 #define CUSTOM_VMCOREDD_BLOB_BYTES  (512 * 1024)
 
+/*
+ * Per-CPU register and stack snapshot captured on NMI / panic.
+ * Stored in a per-CPU variable; copied into the vmcoredd blob by
+ * custom_vmcoredd_prepare_blob() after all CPUs have responded.
+ */
 struct custom_nmi_cpu_state {
 	bool valid;
 	u16 cs;
@@ -77,6 +100,11 @@ struct custom_nmi_cpu_state {
 	u8 stack_snapshot[CUSTOM_STACK_SNAPSHOT_BYTES];
 };
 
+/*
+ * Header placed at the start of the vmcoredd blob (custom_vmcoredd_blob[0]).
+ * Followed by record_count × custom_vmcoredd_cpu_record, then printk_tail bytes.
+ * payload_crc covers everything after the header.
+ */
 struct custom_vmcoredd_header {
 	u32 magic;
 	u32 version;
@@ -93,6 +121,7 @@ struct custom_vmcoredd_header {
 	u32 ioport32;
 };
 
+/* One record per captured CPU, appended after the header in the blob. */
 struct custom_vmcoredd_cpu_record {
 	u32 cpu;
 	u32 reserved;
@@ -100,18 +129,17 @@ struct custom_vmcoredd_cpu_record {
 };
 
 static DEFINE_PER_CPU(struct custom_nmi_cpu_state, custom_nmi_cpu_state);
-static atomic_t custom_nmi_panic_once = ATOMIC_INIT(0);
 
-static bool custom_nmi_panic = true;
-module_param_named(custom_crashdump_nmi_panic, custom_nmi_panic, bool, 0644);
-
+/* Whether to register NMI handlers (can be disabled via kernel cmdline). */
 static bool custom_nmi_handlers = true;
 module_param_named(custom_crashdump_nmi_handlers, custom_nmi_handlers, bool, 0644);
 
+/* Number of stack bytes to snapshot per CPU (capped at CUSTOM_STACK_SNAPSHOT_BYTES). */
 static unsigned int custom_stack_copy_bytes = CUSTOM_STACK_SNAPSHOT_BYTES;
 module_param_named(custom_crashdump_stack_copy_bytes,
 		   custom_stack_copy_bytes, uint, 0644);
 
+/* How long to wait for all CPUs to respond to NMI before giving up, in µs. */
 static unsigned int custom_wait_us = 500000;
 module_param_named(custom_crashdump_wait_us, custom_wait_us, uint, 0644);
 
@@ -139,6 +167,7 @@ static struct vmcoredd_data custom_vmcoredd_data = {
 	.vmcoredd_callback = custom_vmcoredd_copy_from_oldmem,
 };
 
+/* Returns the number of online CPUs that have set valid=true in their state. */
 static unsigned int custom_count_captured_cpus(void)
 {
 	unsigned int seen = 0;
@@ -152,6 +181,13 @@ static unsigned int custom_count_captured_cpus(void)
 	return seen;
 }
 
+/*
+ * kmsg_dump callback registered for KMSG_DUMP_PANIC.
+ * This runs after panic() has finished dumping, i.e. AFTER the panic notifier
+ * chain, so it arrives too late to populate the vmcoredd blob.  It is kept as
+ * a fallback / reference path; the actual capture is done inside
+ * custom_crashdump_capture() which runs via the panic notifier.
+ */
 static void custom_kmsg_dump_cb(struct kmsg_dumper *dumper,
 				struct kmsg_dump_detail *detail)
 {
@@ -174,6 +210,10 @@ static void custom_kmsg_dump_cb(struct kmsg_dumper *dumper,
 	custom_printk_tail_crc = crc32_le(0, custom_printk_tail, out_len);
 }
 
+/*
+ * Read a 32-bit dword from PCI config space using legacy CF8/CFC I/O ports.
+ * Used as a fallback when the PCI driver has not yet bound to the test device.
+ */
 static u32 custom_nmi_pci_cfg_read_dword(u8 bus, u8 dev, u8 fn, u8 off)
 {
 	u32 addr;
@@ -184,6 +224,11 @@ static u32 custom_nmi_pci_cfg_read_dword(u8 bus, u8 dev, u8 fn, u8 off)
 	return inl(0xcfc);
 }
 
+/*
+ * PCI driver probe for the QEMU test device (vendor=0x1d5f, device=0xcafe).
+ * Maps BAR0 (MMIO) and records BAR1 (I/O port base) so they can be read
+ * during crash capture without going through config space re-probing.
+ */
 static int custom_crashdump_test_probe(struct pci_dev *pdev,
 				      const struct pci_device_id *id)
 {
@@ -238,6 +283,12 @@ static struct pci_driver custom_crashdump_test_driver = {
 
 builtin_pci_driver(custom_crashdump_test_driver);
 
+/*
+ * Collect current register values from the test PCI device.
+ * Prefers the live MMIO/PIO mappings when the driver is bound; falls back to
+ * direct config-space + ioremap reads when called before probe() or in NMI
+ * context where the driver structures may not be fully initialised.
+ */
 static void custom_collect_device_values(u32 *cfg40, u32 *mmio_val, u32 *io_val)
 {
 	u32 bar0;
@@ -250,8 +301,6 @@ static void custom_collect_device_values(u32 *cfg40, u32 *mmio_val, u32 *io_val)
 
 	if (custom_test_pdev) {
 		pci_read_config_dword(custom_test_pdev, CUSTOM_NMI_CFG_DWORD, cfg40);
-		bar0 = (u32)(custom_test_pdev->resource[0].start & ~0xfULL);
-		bar1 = (u32)(custom_test_pio & ~0x3ULL);
 
 		if (custom_test_mmio)
 			*mmio_val = ioread32(custom_test_mmio);
@@ -284,6 +333,12 @@ static void custom_collect_device_values(u32 *cfg40, u32 *mmio_val, u32 *io_val)
 	}
 }
 
+/*
+ * Capture the register state of the current CPU into its per-CPU slot.
+ * Reads all general-purpose registers, segment selectors, control registers,
+ * debug registers, APIC base MSR, and a snapshot of the current kernel stack.
+ * Safe to call from NMI context.
+ */
 static void custom_nmi_capture(struct pt_regs *regs)
 {
 	struct custom_nmi_cpu_state *state = this_cpu_ptr(&custom_nmi_cpu_state);
@@ -344,6 +399,19 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	}
 }
 
+/*
+ * Main panic-time entry point, exported for crash.c / machine_kexec.c.
+ *
+ * Called from crash_kexec() (via the panic notifier) before kexec starts.
+ * Responsibilities:
+ *   1. Capture the panicking CPU's registers via custom_nmi_capture().
+ *   2. Trigger NMI on all other CPUs so they populate their per-CPU slots.
+ *   3. Collect the printk tail directly (panic() calls notifiers BEFORE
+ *      kmsg_dump, so we must read kmsg here rather than relying on
+ *      custom_kmsg_dump_cb which would run too late).
+ *   4. Wait up to custom_wait_us µs for all CPUs to respond.
+ *   5. Read device registers and assemble the vmcoredd blob.
+ */
 void custom_crashdump_capture(struct pt_regs *regs);
 void custom_crashdump_capture(struct pt_regs *regs)
 {
@@ -354,9 +422,26 @@ void custom_crashdump_capture(struct pt_regs *regs)
 	unsigned int target_cpus = num_online_cpus();
 	unsigned int max_tries;
 	int tries;
+	struct kmsg_dump_iter iter;
+	size_t out_len = 0;
 
 	custom_nmi_capture(regs);
 	trigger_all_cpu_backtrace();
+
+	/*
+	 * Collect printk tail here, before calling custom_vmcoredd_prepare_blob().
+	 * panic() calls panic notifiers (us) before kmsg_dump(), so
+	 * custom_kmsg_dump_cb() would run too late to populate this buffer.
+	 */
+	kmsg_dump_rewind(&iter);
+	if (kmsg_dump_get_buffer(&iter, true, custom_printk_tail,
+				 sizeof(custom_printk_tail), &out_len)) {
+		custom_printk_tail_len = out_len;
+		custom_printk_tail_crc = crc32_le(0, custom_printk_tail, out_len);
+	} else {
+		custom_printk_tail_len = 0;
+		custom_printk_tail_crc = 0;
+	}
 
 	max_tries = custom_wait_us / 10;
 	if (!max_tries)
@@ -380,7 +465,13 @@ void custom_crashdump_capture(struct pt_regs *regs)
 	 */
 }
 
-/* Override the weak stub in kernel/vmcore_info.c */
+/*
+ * Override the weak stub in kernel/vmcore_info.c.
+ * Called from crash_save_vmcoreinfo() after the vmcoreinfo buffer has been
+ * switched to the crash-safe copy.  Appends key=value pairs describing the
+ * vmcoredd blob location so the 2nd (kdump) kernel can locate it from the
+ * ELF PT_NOTE segment in /proc/vmcore.
+ */
 void custom_vmcoreinfo_extra_append(void);
 void custom_vmcoreinfo_extra_append(void)
 {
@@ -403,6 +494,18 @@ void custom_vmcoreinfo_extra_append(void)
 	vmcoreinfo_append_str("CUSTOM_IOPORT32=0x%08x\n", hdr->ioport32);
 }
 
+/*
+ * Assemble the vmcoredd blob in custom_vmcoredd_blob[].
+ *
+ * Layout:
+ *   [0]                  custom_vmcoredd_header
+ *   [sizeof(header)]     record_count × custom_vmcoredd_cpu_record  (CPU states)
+ *   [header + records]   printk tail bytes  (up to CUSTOM_PRINTK_TAIL_BYTES)
+ *
+ * payload_crc covers everything after the header (records + tail).
+ * Updates custom_vmcoredd_blob_size so the 2nd kernel knows how many bytes
+ * to copy via custom_vmcoredd_copy_from_oldmem().
+ */
 static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
 					 unsigned int seen)
 {
@@ -463,6 +566,7 @@ static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
 	custom_vmcoredd_blob_size = hdr->total_size;
 }
 
+/* Parse a "KEY=value\n" line from a vmcoreinfo string into a u64. */
 static bool custom_vmcoreinfo_get_u64(const char *vmcoreinfo, const char *key,
 				      u64 *value)
 {
@@ -487,6 +591,10 @@ static bool custom_vmcoreinfo_get_u64(const char *vmcoreinfo, const char *key,
 	return !kstrtoull(tmp, 0, value);
 }
 
+/*
+ * Walk a raw ELF PT_NOTE region and locate the VMCOREINFO note.
+ * Returns true and copies the note descriptor into *out on success.
+ */
 static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 					    char *out, size_t out_sz)
 {
@@ -524,6 +632,11 @@ static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 	return false;
 }
 
+/*
+ * Read the vmcoreinfo ELF note from the 1st kernel's ELF core header
+ * (accessible via elfcorehdr_addr in the 2nd kernel).
+ * Only ELF64 format is supported; returns -EINVAL for ELF32.
+ */
 static int custom_read_vmcoreinfo_from_oldmem(char *out, size_t out_sz)
 {
 	unsigned char ident[EI_NIDENT];
@@ -592,65 +705,15 @@ out_free_64:
 		return ret;
 	}
 
-	if (ident[EI_CLASS] == ELFCLASS32) {
-		Elf32_Ehdr ehdr;
-		Elf32_Phdr *phdrs;
-		int i;
-
-		pos = elfcorehdr_addr;
-		ret = elfcorehdr_read((char *)&ehdr, sizeof(ehdr), &pos);
-		if (ret < 0)
-			return ret;
-
-		phdrs = vmalloc(array_size(ehdr.e_phnum, sizeof(*phdrs)));
-		if (!phdrs)
-			return -ENOMEM;
-
-		pos = elfcorehdr_addr + ehdr.e_phoff;
-		ret = elfcorehdr_read((char *)phdrs,
-				     ehdr.e_phnum * sizeof(*phdrs), &pos);
-		if (ret < 0)
-			goto out_free_32;
-
-		for (i = 0; i < ehdr.e_phnum; i++) {
-			void *notes;
-			u64 note_pos;
-
-			if (phdrs[i].p_type != PT_NOTE || !phdrs[i].p_memsz)
-				continue;
-
-			notes = vmalloc(phdrs[i].p_memsz);
-			if (!notes) {
-				ret = -ENOMEM;
-				goto out_free_32;
-			}
-
-			note_pos = phdrs[i].p_offset;
-			ret = elfcorehdr_read_notes(notes, phdrs[i].p_memsz, &note_pos);
-			if (ret < 0) {
-				vfree(notes);
-				goto out_free_32;
-			}
-
-			if (custom_find_vmcoreinfo_in_notes(notes, phdrs[i].p_memsz,
-							   out, out_sz)) {
-				vfree(notes);
-				ret = 0;
-				goto out_free_32;
-			}
-
-			vfree(notes);
-		}
-
-		ret = -ENOENT;
-out_free_32:
-		vfree(phdrs);
-		return ret;
-	}
-
 	return -EINVAL;
 }
 
+/*
+ * vmcoredd callback invoked by the vmcore layer when user space reads the
+ * device dump region from /proc/vmcore.  Streams custom_vmcoredd_blob_size
+ * bytes of old memory (physical address custom_vmcoredd_oldmem_paddr) into
+ * the caller-supplied buffer page by page.
+ */
 static int custom_vmcoredd_copy_from_oldmem(struct vmcoredd_data *data, void *buf)
 {
 	u64 pos = custom_vmcoredd_oldmem_paddr;
@@ -680,14 +743,28 @@ static int custom_vmcoredd_copy_from_oldmem(struct vmcoredd_data *data, void *bu
 	return 0;
 }
 
+/*
+ * Register the vmcoredd device dump with the vmcore layer (2nd kernel only).
+ *
+ * Reads CUSTOM_VMCOREDD_PADDR and CUSTOM_VMCOREDD_SIZE from the vmcoreinfo
+ * ELF note that the 1st kernel embedded in elfcorehdr.  Those values point
+ * to the blob assembled by custom_vmcoredd_prepare_blob() in the 1st kernel.
+ *
+ * Note: is_kdump_kernel() is used instead of is_vmcore_usable() because
+ * vmcore_init() (fs_initcall) sets elfcorehdr_addr = ELFCORE_ADDR_ERR on
+ * success, which makes is_vmcore_usable() return false at late_initcall time.
+ * is_kdump_kernel() only checks that elfcorehdr_addr != ELFCORE_ADDR_MAX and
+ * is therefore correct here.
+ */
 static int __init custom_vmcoredd_register(void)
 {
 	u64 paddr;
 	u64 size;
 	int ret;
 
-	if (!is_vmcore_usable())
+	if (!is_kdump_kernel()) {
 		return 0;
+	}
 
 	ret = custom_read_vmcoreinfo_from_oldmem(custom_vmcoreinfo_scratch,
 					 sizeof(custom_vmcoreinfo_scratch));
@@ -724,26 +801,24 @@ static int __init custom_vmcoredd_register(void)
 	return 0;
 }
 
+/*
+ * NMI handler registered for both NMI_UNKNOWN and NMI_LOCAL.
+ * Captures the current CPU's register state so it is available when
+ * the panic CPU assembles the vmcoredd blob.
+ */
 static int custom_nmi_handler(unsigned int val, struct pt_regs *regs)
 {
 	custom_nmi_capture(regs);
-
-	if (!custom_nmi_panic)
-		return NMI_DONE;
-
-	if (atomic_cmpxchg(&custom_nmi_panic_once, 0, 1) == 0) {
-		/* Ask other CPUs to enter NMI path before panicking this CPU. */
-		trigger_all_cpu_backtrace();
-		panic("custom crashdump: panic via NMI");
-	}
-
-	/*
-	 * Do not consume the NMI event so the default crash/NMI paths can
-	 * continue to collect per-CPU crash notes for vmcore.
-	 */
 	return NMI_DONE;
 }
 
+/*
+ * Panic notifier called early in the panic() path (priority INT_MAX-1),
+ * before smp_send_stop() and before kexec jump.
+ * Logs how many CPUs have already been captured by the NMI handler.
+ * The actual full capture (printk tail + blob assembly) is handled by
+ * custom_crashdump_capture(), which is called from crash_kexec().
+ */
 static int custom_panic_notifier(struct notifier_block *nb,
 					unsigned long action, void *data)
 {
@@ -766,6 +841,14 @@ static struct notifier_block custom_panic_nb = {
 	.priority = INT_MAX - 1,
 };
 
+/*
+ * arch_initcall: register NMI handlers, panic notifier, and kmsg dumper.
+ *
+ * Runs during early boot (after PCI probe).  Registers:
+ *   - NMI_UNKNOWN + NMI_LOCAL handlers for per-CPU register capture
+ *   - panic notifier to log capture status
+ *   - kmsg_dump callback for KMSG_DUMP_PANIC (fallback / reference)
+ */
 static int __init custom_crashdump_nmi_init(void)
 {
 	int rc;
@@ -815,12 +898,23 @@ static int __init custom_crashdump_nmi_init(void)
 		return rc;
 	}
 
-	rc = custom_vmcoredd_register();
-	if (rc && rc != -ENOENT)
-		pr_warn("custom vmcoredd: registration skipped (%d)\n", rc);
-
-	pr_info("custom crashdump NMI+panic notifier enabled (vmcoredd=%s)\n",
-		is_vmcore_usable() ? "on" : "deferred");
+	pr_info("custom crashdump NMI+panic notifier enabled\n");
 	return 0;
 }
 arch_initcall(custom_crashdump_nmi_init);
+
+/*
+ * late_initcall: attempt to register the vmcoredd blob in the 2nd kernel.
+ * Runs after vmcore_init() has completed so /proc/vmcore is almost ready.
+ * Ignores -ENOENT (not a kdump kernel or metadata not present).
+ */
+static int __init custom_vmcoredd_late_init(void)
+{
+	int rc;
+
+	rc = custom_vmcoredd_register();
+	if (rc && rc != -ENOENT)
+		pr_warn("custom vmcoredd: registration skipped (%d)\n", rc);
+	return 0;
+}
+late_initcall(custom_vmcoredd_late_init);
