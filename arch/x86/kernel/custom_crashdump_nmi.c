@@ -105,9 +105,15 @@ static atomic_t custom_nmi_panic_once = ATOMIC_INIT(0);
 static bool custom_nmi_panic = true;
 module_param_named(custom_crashdump_nmi_panic, custom_nmi_panic, bool, 0644);
 
+static bool custom_nmi_handlers = true;
+module_param_named(custom_crashdump_nmi_handlers, custom_nmi_handlers, bool, 0644);
+
 static unsigned int custom_stack_copy_bytes = CUSTOM_STACK_SNAPSHOT_BYTES;
 module_param_named(custom_crashdump_stack_copy_bytes,
 		   custom_stack_copy_bytes, uint, 0644);
+
+static unsigned int custom_wait_us = 500000;
+module_param_named(custom_crashdump_wait_us, custom_wait_us, uint, 0644);
 
 static struct kmsg_dumper custom_kmsg_dumper;
 static char custom_printk_tail[CUSTOM_PRINTK_TAIL_BYTES];
@@ -346,12 +352,17 @@ void custom_crashdump_capture(struct pt_regs *regs)
 	u32 io_val;
 	unsigned int seen;
 	unsigned int target_cpus = num_online_cpus();
+	unsigned int max_tries;
 	int tries;
 
 	custom_nmi_capture(regs);
 	trigger_all_cpu_backtrace();
 
-	for (tries = 0; tries < 1000; tries++) {
+	max_tries = custom_wait_us / 10;
+	if (!max_tries)
+		max_tries = 1;
+
+	for (tries = 0; tries < max_tries; tries++) {
 		seen = custom_count_captured_cpus();
 		if (seen >= target_cpus)
 			break;
@@ -718,7 +729,7 @@ static int custom_nmi_handler(unsigned int val, struct pt_regs *regs)
 	custom_nmi_capture(regs);
 
 	if (!custom_nmi_panic)
-		return NMI_HANDLED;
+		return NMI_DONE;
 
 	if (atomic_cmpxchg(&custom_nmi_panic_once, 0, 1) == 0) {
 		/* Ask other CPUs to enter NMI path before panicking this CPU. */
@@ -726,7 +737,11 @@ static int custom_nmi_handler(unsigned int val, struct pt_regs *regs)
 		panic("custom crashdump: panic via NMI");
 	}
 
-	return NMI_HANDLED;
+	/*
+	 * Do not consume the NMI event so the default crash/NMI paths can
+	 * continue to collect per-CPU crash notes for vmcore.
+	 */
+	return NMI_DONE;
 }
 
 static int custom_panic_notifier(struct notifier_block *nb,
@@ -754,23 +769,35 @@ static struct notifier_block custom_panic_nb = {
 static int __init custom_crashdump_nmi_init(void)
 {
 	int rc;
+	bool nmi_registered = false;
 
-	rc = register_nmi_handler(NMI_UNKNOWN, custom_nmi_handler,
-				  NMI_FLAG_FIRST, "custom-crashdump-nmi-unknown");
-	if (rc)
-		return rc;
+	if (custom_nmi_handlers) {
+		rc = register_nmi_handler(NMI_UNKNOWN, custom_nmi_handler,
+					  NMI_FLAG_FIRST,
+					  "custom-crashdump-nmi-unknown");
+		if (rc)
+			return rc;
 
-	rc = register_nmi_handler(NMI_LOCAL, custom_nmi_handler,
-				  NMI_FLAG_FIRST, "custom-crashdump-nmi-local");
-	if (rc) {
-		unregister_nmi_handler(NMI_UNKNOWN, "custom-crashdump-nmi-unknown");
-		return rc;
+		rc = register_nmi_handler(NMI_LOCAL, custom_nmi_handler,
+					  NMI_FLAG_FIRST,
+					  "custom-crashdump-nmi-local");
+		if (rc) {
+			unregister_nmi_handler(NMI_UNKNOWN,
+						"custom-crashdump-nmi-unknown");
+			return rc;
+		}
+
+		nmi_registered = true;
 	}
 
 	rc = atomic_notifier_chain_register(&panic_notifier_list, &custom_panic_nb);
 	if (rc) {
-		unregister_nmi_handler(NMI_LOCAL, "custom-crashdump-nmi-local");
-		unregister_nmi_handler(NMI_UNKNOWN, "custom-crashdump-nmi-unknown");
+		if (nmi_registered) {
+			unregister_nmi_handler(NMI_LOCAL,
+						"custom-crashdump-nmi-local");
+			unregister_nmi_handler(NMI_UNKNOWN,
+						"custom-crashdump-nmi-unknown");
+		}
 		return rc;
 	}
 
@@ -779,8 +806,12 @@ static int __init custom_crashdump_nmi_init(void)
 	rc = kmsg_dump_register(&custom_kmsg_dumper);
 	if (rc) {
 		atomic_notifier_chain_unregister(&panic_notifier_list, &custom_panic_nb);
-		unregister_nmi_handler(NMI_LOCAL, "custom-crashdump-nmi-local");
-		unregister_nmi_handler(NMI_UNKNOWN, "custom-crashdump-nmi-unknown");
+		if (nmi_registered) {
+			unregister_nmi_handler(NMI_LOCAL,
+						"custom-crashdump-nmi-local");
+			unregister_nmi_handler(NMI_UNKNOWN,
+						"custom-crashdump-nmi-unknown");
+		}
 		return rc;
 	}
 
