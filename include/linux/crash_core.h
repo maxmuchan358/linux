@@ -81,6 +81,7 @@ extern void __crash_kexec(struct pt_regs *regs);
 extern void crash_kexec(struct pt_regs *regs);
 int kexec_should_crash(struct task_struct *p);
 int kexec_crash_loaded(void);
+void custom_crashdump_capture(struct pt_regs *regs);
 void crash_save_cpu(struct pt_regs *regs, int cpu);
 extern int kimage_crash_copy_vmcoreinfo(struct kimage *image);
 
@@ -92,6 +93,7 @@ static inline void __crash_kexec(struct pt_regs *regs) { }
 static inline void crash_kexec(struct pt_regs *regs) { }
 static inline int kexec_should_crash(struct task_struct *p) { return 0; }
 static inline int kexec_crash_loaded(void) { return 0; }
+static inline void custom_crashdump_capture(struct pt_regs *regs) { }
 static inline void crash_save_cpu(struct pt_regs *regs, int cpu) {};
 static inline int kimage_crash_copy_vmcoreinfo(struct kimage *image) { return 0; };
 #endif /* CONFIG_CRASH_DUMP*/
