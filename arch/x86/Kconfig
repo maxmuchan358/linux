@@ -2012,6 +2012,28 @@ config ARCH_SUPPORTS_CRASH_DUMP
 config ARCH_DEFAULT_CRASH_DUMP
 	def_bool y
 
+config CUSTOM_CRASHDUMP_NMI
+	bool "Custom crash dump via NMI and vmcoredd (x86-64)"
+	depends on CRASH_DUMP && X86_64
+	help
+	  Capture per-CPU register state and printk tail at panic time via
+	  NMI IPI and embed the result as a vmcoredd device dump blob in
+	  /proc/vmcore.  The capture tool (show_vmcoredd.py) can extract and
+	  decode the blob from the second (kdump) kernel.
+
+	  If unsure, say N.
+
+config CUSTOM_CRASHDUMP_NMI_TEST_DEV
+	bool "Custom crash dump: QEMU test PCI device (vendor=0x1d5f/device=0xcafe)"
+	depends on CUSTOM_CRASHDUMP_NMI && PCI
+	help
+	  Register a builtin PCI driver for the QEMU test device used to
+	  exercise PCI register capture in custom_crashdump_nmi.  This
+	  device does not exist on real hardware.  Disable for production
+	  kernels to avoid the unnecessary probe.
+
+	  If unsure, say N.
+
 config ARCH_SUPPORTS_CRASH_HOTPLUG
 	def_bool y
 

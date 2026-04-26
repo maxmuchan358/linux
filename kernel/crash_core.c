@@ -42,8 +42,6 @@ note_buf_t __percpu *crash_notes;
 
 #ifdef CONFIG_CRASH_DUMP
 
-void custom_crashdump_capture(struct pt_regs *regs);
-
 void __weak custom_crashdump_capture(struct pt_regs *regs)
 {
 }

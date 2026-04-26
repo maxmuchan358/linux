@@ -78,7 +78,6 @@ void crash_update_vmcoreinfo_safecopy(void *ptr)
  * switched to the safe copy.  Architecture/platform code may override this
  * weak stub to append extra keys that must survive into the ELF note.
  */
-void custom_vmcoreinfo_extra_append(void);
 void __weak custom_vmcoreinfo_extra_append(void) {}
 
 void crash_save_vmcoreinfo(void)

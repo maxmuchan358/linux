@@ -9,7 +9,7 @@
  *
  * Flow (1st kernel):
  *   NMI                -> custom_nmi_handler()           : per-CPU register snapshot
- *   panic() notifier   -> custom_crashdump_capture()     : collect all CPUs + printk tail
+ *   crash_kexec()      -> custom_crashdump_capture()     : collect all CPUs + printk tail
  *   crash_save_vmcoreinfo() -> custom_vmcoreinfo_extra_append() : write keys to ELF note
  *
  * Flow (2nd / kdump kernel):
@@ -37,27 +37,25 @@
 #include <linux/sched/task_stack.h>
 #include <linux/types.h>
 #include <linux/uio.h>
+#include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/vmcore_info.h>
 
+#include <asm/asm.h>
 #include <asm/debugreg.h>
 #include <asm/io.h>
 #include <asm/msr.h>
 #include <asm/nmi.h>
 #include <asm/paravirt.h>
+#include <asm/ptrace.h>
 
-#define CUSTOM_NMI_DEV_BUS          0
-#define CUSTOM_NMI_DEV_DEV          0x5
-#define CUSTOM_NMI_DEV_FN           0
 #define CUSTOM_TEST_VENDOR_ID       0x1d5f
 #define CUSTOM_TEST_DEVICE_ID       0xcafe
 #define CUSTOM_NMI_CFG_DWORD        0x40
-#define CUSTOM_NMI_CFG_BAR0         0x10
-#define CUSTOM_NMI_CFG_BAR1         0x14
 #define CUSTOM_STACK_SNAPSHOT_BYTES 512
 #define CUSTOM_PRINTK_TAIL_BYTES    4096
 #define CUSTOM_VMCOREDD_MAGIC       0x4344564d
-#define CUSTOM_VMCOREDD_VERSION     1
+#define CUSTOM_VMCOREDD_VERSION     3
 #define CUSTOM_VMCOREDD_MAX_CPUS    256
 #define CUSTOM_VMCOREDD_BLOB_BYTES  (512 * 1024)
 
@@ -65,9 +63,14 @@
  * Per-CPU register and stack snapshot captured on NMI / panic.
  * Stored in a per-CPU variable; copied into the vmcoredd blob by
  * custom_vmcoredd_prepare_blob() after all CPUs have responded.
+ *
+ * Wire-format note: bool valid occupies 1 byte followed by 1 byte of implicit
+ * compiler padding before u16 cs.  The layout is fixed; a BUILD_BUG_ON below
+ * verifies the offsets so that the Python parser stays in sync.
  */
 struct custom_nmi_cpu_state {
 	bool valid;
+	/* 1-byte implicit padding here; verified by BUILD_BUG_ON in nmi_init */
 	u16 cs;
 	u16 ss;
 	u64 ip;
@@ -95,9 +98,21 @@ struct custom_nmi_cpu_state {
 	u64 dr6;
 	u64 dr7;
 	u64 apic_base;
+	/* Kernel stack snapshot (kept in legacy fields for parser compatibility). */
 	u32 stack_len;
 	u32 stack_crc;
 	u8 stack_snapshot[CUSTOM_STACK_SNAPSHOT_BYTES];
+	/* Optional user stack snapshot (captured only on user-mode entries). */
+	u32 user_stack_len;
+	u32 user_stack_crc;
+	u8 user_stack_snapshot[CUSTOM_STACK_SNAPSHOT_BYTES];
+	/*
+	 * Generation tag: must match custom_capture_generation at assembly time
+	 * to be counted as a valid panic capture.  Prevents a spurious NMI that
+	 * fires between custom_reset_capture_valid_bits() and
+	 * trigger_all_cpu_backtrace() from being mistaken for a panic snapshot.
+	 */
+	u32 capture_gen;
 };
 
 /*
@@ -132,7 +147,10 @@ static DEFINE_PER_CPU(struct custom_nmi_cpu_state, custom_nmi_cpu_state);
 
 /* Whether to register NMI handlers (can be disabled via kernel cmdline). */
 static bool custom_nmi_handlers = true;
-module_param_named(custom_crashdump_nmi_handlers, custom_nmi_handlers, bool, 0644);
+/* Read-only: handler registration happens once at arch_initcall; runtime
+ * changes have no effect on the already-registered (or not) handlers.
+ */
+module_param_named(custom_crashdump_nmi_handlers, custom_nmi_handlers, bool, 0444);
 
 /* Number of stack bytes to snapshot per CPU (capped at CUSTOM_STACK_SNAPSHOT_BYTES). */
 static unsigned int custom_stack_copy_bytes = CUSTOM_STACK_SNAPSHOT_BYTES;
@@ -143,7 +161,15 @@ module_param_named(custom_crashdump_stack_copy_bytes,
 static unsigned int custom_wait_us = 500000;
 module_param_named(custom_crashdump_wait_us, custom_wait_us, uint, 0644);
 
-static struct kmsg_dumper custom_kmsg_dumper;
+/*
+ * Monotonically increasing capture generation.  Incremented once at the start
+ * of each panic capture round (before valid bits are reset).  Per-CPU NMI
+ * captures tag their slot with the current generation so that any NMI that
+ * fires in the window between the valid-bit reset and trigger_all_cpu_backtrace
+ * can be distinguished from the authoritative panic snapshot.
+ */
+static unsigned int custom_capture_generation;
+
 static char custom_printk_tail[CUSTOM_PRINTK_TAIL_BYTES];
 static size_t custom_printk_tail_len;
 static u32 custom_printk_tail_crc;
@@ -151,14 +177,24 @@ static u32 custom_printk_tail_crc;
 static struct pci_dev *custom_test_pdev;
 static void __iomem *custom_test_mmio;
 static resource_size_t custom_test_pio;
+static u32 custom_test_cfg40_cached;
+static u32 custom_test_mmio_cached = 0xffffffff;
+static u32 custom_test_io_cached = 0xffffffff;
+/*
+ * Static BSS blob for the vmcoredd payload assembled at panic time.
+ * Worst-case size calculation:
+ *   CUSTOM_VMCOREDD_MAX_CPUS (256) × sizeof(custom_vmcoredd_cpu_record)
+ *   + sizeof(custom_vmcoredd_header) + CUSTOM_PRINTK_TAIL_BYTES
+ *   ≈ 256 × 1264 + 52 + 4096 ≈ 328 KB
+ * 512 KB provides comfortable headroom without wasting BSS space.
+ */
 static u8 custom_vmcoredd_blob[CUSTOM_VMCOREDD_BLOB_BYTES];
 static size_t custom_vmcoredd_blob_size;
 static u64 custom_vmcoredd_oldmem_paddr;
 static unsigned int custom_vmcoredd_oldmem_size;
 static char custom_vmcoreinfo_scratch[VMCOREINFO_BYTES + 1];
 
-static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
-					 unsigned int seen);
+static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val);
 
 static int custom_vmcoredd_copy_from_oldmem(struct vmcoredd_data *data, void *buf);
 
@@ -174,66 +210,44 @@ static unsigned int custom_count_captured_cpus(void)
 	int cpu;
 
 	for_each_online_cpu(cpu) {
-		if (per_cpu(custom_nmi_cpu_state, cpu).valid)
+		struct custom_nmi_cpu_state *s = &per_cpu(custom_nmi_cpu_state, cpu);
+
+		/*
+		 * The acquire on valid pairs with the release in custom_nmi_capture().
+		 * Once valid=true is visible, capture_gen is also visible (written
+		 * before the store-release), so a plain read is sufficient.
+		 */
+		if (smp_load_acquire(&s->valid) &&
+		    s->capture_gen == custom_capture_generation)
 			seen++;
 	}
 
 	return seen;
 }
 
-/*
- * kmsg_dump callback registered for KMSG_DUMP_PANIC.
- * This runs after panic() has finished dumping, i.e. AFTER the panic notifier
- * chain, so it arrives too late to populate the vmcoredd blob.  It is kept as
- * a fallback / reference path; the actual capture is done inside
- * custom_crashdump_capture() which runs via the panic notifier.
- */
-static void custom_kmsg_dump_cb(struct kmsg_dumper *dumper,
-				struct kmsg_dump_detail *detail)
+/* Clear per-CPU capture valid bits before starting a new panic capture round. */
+static void custom_reset_capture_valid_bits(void)
 {
-	struct kmsg_dump_iter iter;
-	size_t out_len = 0;
+	int cpu;
 
-	if (detail->reason != KMSG_DUMP_PANIC)
-		return;
-
-	kmsg_dump_rewind(&iter);
-
-	if (!kmsg_dump_get_buffer(&iter, true, custom_printk_tail,
-				 sizeof(custom_printk_tail), &out_len)) {
-		custom_printk_tail_len = 0;
-		custom_printk_tail_crc = 0;
-		return;
-	}
-
-	custom_printk_tail_len = out_len;
-	custom_printk_tail_crc = crc32_le(0, custom_printk_tail, out_len);
-}
-
-/*
- * Read a 32-bit dword from PCI config space using legacy CF8/CFC I/O ports.
- * Used as a fallback when the PCI driver has not yet bound to the test device.
- */
-static u32 custom_nmi_pci_cfg_read_dword(u8 bus, u8 dev, u8 fn, u8 off)
-{
-	u32 addr;
-
-	addr = BIT(31) | ((u32)bus << 16) | ((u32)PCI_DEVFN(dev, fn) << 8) |
-	       (off & 0xfc);
-	outl(addr, 0xcf8);
-	return inl(0xcfc);
+	for_each_online_cpu(cpu)
+		WRITE_ONCE(per_cpu(custom_nmi_cpu_state, cpu).valid, false);
 }
 
 /*
  * PCI driver probe for the QEMU test device (vendor=0x1d5f, device=0xcafe).
  * Maps BAR0 (MMIO) and records BAR1 (I/O port base) so they can be read
  * during crash capture without going through config space re-probing.
+ *
+ * Compiled only when CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV=y.
  */
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV
 static int custom_crashdump_test_probe(struct pci_dev *pdev,
 				      const struct pci_device_id *id)
 {
 	u16 vendor = 0;
 	u16 device = 0;
+	u32 cfg40;
 
 	if (pcim_enable_device(pdev))
 		return -ENODEV;
@@ -249,6 +263,19 @@ static int custom_crashdump_test_probe(struct pci_dev *pdev,
 		custom_test_pio = pci_resource_start(pdev, 1);
 	else
 		custom_test_pio = 0;
+
+	pci_read_config_dword(pdev, CUSTOM_NMI_CFG_DWORD, &cfg40);
+	WRITE_ONCE(custom_test_cfg40_cached, cfg40);
+
+	if (custom_test_mmio)
+		WRITE_ONCE(custom_test_mmio_cached, ioread32(custom_test_mmio));
+	else
+		WRITE_ONCE(custom_test_mmio_cached, 0xffffffff);
+
+	if (custom_test_pio)
+		WRITE_ONCE(custom_test_io_cached, inl(custom_test_pio));
+	else
+		WRITE_ONCE(custom_test_io_cached, 0xffffffff);
 
 	pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor);
 	pci_read_config_word(pdev, PCI_DEVICE_ID, &device);
@@ -266,6 +293,9 @@ static void custom_crashdump_test_remove(struct pci_dev *pdev)
 		custom_test_pdev = NULL;
 		custom_test_mmio = NULL;
 		custom_test_pio = 0;
+		WRITE_ONCE(custom_test_cfg40_cached, 0);
+		WRITE_ONCE(custom_test_mmio_cached, 0xffffffff);
+		WRITE_ONCE(custom_test_io_cached, 0xffffffff);
 	}
 }
 
@@ -282,6 +312,7 @@ static struct pci_driver custom_crashdump_test_driver = {
 };
 
 builtin_pci_driver(custom_crashdump_test_driver);
+#endif /* CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV */
 
 /*
  * Collect current register values from the test PCI device.
@@ -291,45 +322,27 @@ builtin_pci_driver(custom_crashdump_test_driver);
  */
 static void custom_collect_device_values(u32 *cfg40, u32 *mmio_val, u32 *io_val)
 {
-	u32 bar0;
-	u32 bar1;
-	void __iomem *mmio = NULL;
+	/*
+	 * Panic path: avoid PCI config transactions and dynamic ioremap.
+	 * Use values cached during normal operation and only perform direct
+	 * MMIO/PIO reads when existing mappings are already available.
+	 */
+	*cfg40 = READ_ONCE(custom_test_cfg40_cached);
+	*mmio_val = READ_ONCE(custom_test_mmio_cached);
+	*io_val = READ_ONCE(custom_test_io_cached);
 
-	*cfg40 = 0;
-	*mmio_val = 0xffffffff;
-	*io_val = 0xffffffff;
+	if (READ_ONCE(custom_test_mmio)) {
+		u32 v = ioread32(custom_test_mmio);
 
-	if (custom_test_pdev) {
-		pci_read_config_dword(custom_test_pdev, CUSTOM_NMI_CFG_DWORD, cfg40);
+		*mmio_val = v;
+		WRITE_ONCE(custom_test_mmio_cached, v);
+	}
 
-		if (custom_test_mmio)
-			*mmio_val = ioread32(custom_test_mmio);
-		if (custom_test_pio)
-			*io_val = inl(custom_test_pio);
-	} else {
-		*cfg40 = custom_nmi_pci_cfg_read_dword(CUSTOM_NMI_DEV_BUS,
-						      CUSTOM_NMI_DEV_DEV,
-						      CUSTOM_NMI_DEV_FN,
-						      CUSTOM_NMI_CFG_DWORD);
-		bar0 = custom_nmi_pci_cfg_read_dword(CUSTOM_NMI_DEV_BUS,
-					     CUSTOM_NMI_DEV_DEV,
-					     CUSTOM_NMI_DEV_FN,
-					     CUSTOM_NMI_CFG_BAR0) & ~0xf;
-		bar1 = custom_nmi_pci_cfg_read_dword(CUSTOM_NMI_DEV_BUS,
-					     CUSTOM_NMI_DEV_DEV,
-					     CUSTOM_NMI_DEV_FN,
-					     CUSTOM_NMI_CFG_BAR1) & ~0x3;
+	if (READ_ONCE(custom_test_pio)) {
+		u32 v = inl(custom_test_pio);
 
-		if (bar0) {
-			mmio = ioremap(bar0, 0x1000);
-			if (mmio) {
-				*mmio_val = ioread32(mmio);
-				iounmap(mmio);
-			}
-		}
-
-		if (bar1)
-			*io_val = inl(bar1);
+		*io_val = v;
+		WRITE_ONCE(custom_test_io_cached, v);
 	}
 }
 
@@ -344,9 +357,11 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	struct custom_nmi_cpu_state *state = this_cpu_ptr(&custom_nmi_cpu_state);
 	unsigned long stack_base = (unsigned long)task_stack_page(current);
 	unsigned long stack_end = stack_base + THREAD_SIZE;
-	unsigned long stack_ptr = regs ? user_stack_pointer(regs) : 0;
-	unsigned int copy_len = min(custom_stack_copy_bytes,
-				    (unsigned int)CUSTOM_STACK_SNAPSHOT_BYTES);
+	unsigned long kernel_sp = current_stack_pointer;
+	unsigned long user_sp = 0;
+	unsigned int kernel_copy_len = min(custom_stack_copy_bytes,
+					   (unsigned int)CUSTOM_STACK_SNAPSHOT_BYTES);
+	unsigned int user_copy_len = kernel_copy_len;
 	u64 apic_base = 0;
 	unsigned long dr6 = 0;
 	unsigned long dr7 = 0;
@@ -355,9 +370,14 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	get_debugreg(dr6, 6);
 	get_debugreg(dr7, 7);
 
-	state->valid = true;
+	if (regs && !user_mode(regs))
+		kernel_sp = kernel_stack_pointer(regs);
+	if (regs && user_mode(regs))
+		user_sp = user_stack_pointer(regs);
+
+	WRITE_ONCE(state->valid, false);
 	state->ip = regs ? instruction_pointer(regs) : 0;
-	state->sp = regs ? user_stack_pointer(regs) : 0;
+	state->sp = regs ? regs->sp : 0;
 	state->flags = regs ? regs->flags : 0;
 	state->cs = regs ? regs->cs : 0;
 	state->ss = regs ? regs->ss : 0;
@@ -385,34 +405,59 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	state->apic_base = apic_base;
 	state->stack_len = 0;
 	state->stack_crc = 0;
+	state->user_stack_len = 0;
+	state->user_stack_crc = 0;
 
-	if (stack_ptr >= stack_base && stack_ptr < stack_end) {
-		unsigned long avail = stack_end - stack_ptr;
+	if (kernel_sp >= stack_base && kernel_sp < stack_end) {
+		unsigned long avail = stack_end - kernel_sp;
 
-		if (copy_len > avail)
-			copy_len = avail;
-		if (copy_len) {
-			memcpy(state->stack_snapshot, (void *)stack_ptr, copy_len);
-			state->stack_len = copy_len;
-			state->stack_crc = crc32_le(0, state->stack_snapshot, copy_len);
+		if (kernel_copy_len > avail)
+			kernel_copy_len = avail;
+		if (kernel_copy_len) {
+			memcpy(state->stack_snapshot, (void *)kernel_sp, kernel_copy_len);
+			state->stack_len = kernel_copy_len;
+			state->stack_crc = crc32_le(0, state->stack_snapshot,
+						 kernel_copy_len);
 		}
 	}
+
+	if (user_sp && user_copy_len) {
+		unsigned long left;
+		unsigned int copied;
+
+		left = copy_from_user_nmi(state->user_stack_snapshot,
+					 (const void __user *)user_sp, user_copy_len);
+		copied = user_copy_len - left;
+		if (copied) {
+			state->user_stack_len = copied;
+			state->user_stack_crc = crc32_le(0,
+						 state->user_stack_snapshot,
+						 copied);
+		}
+	}
+
+	/*
+	 * Tag with the current capture generation before publishing.  The
+	 * store-release on valid ensures capture_gen is visible to any CPU
+	 * that subsequently loads valid with an acquire.
+	 */
+	state->capture_gen = READ_ONCE(custom_capture_generation);
+	/* Publish this CPU slot only after all fields are fully populated. */
+	smp_store_release(&state->valid, true);
 }
 
 /*
  * Main panic-time entry point, exported for crash.c / machine_kexec.c.
  *
- * Called from crash_kexec() (via the panic notifier) before kexec starts.
+ * Called from crash_kexec() before kexec starts.
  * Responsibilities:
  *   1. Capture the panicking CPU's registers via custom_nmi_capture().
  *   2. Trigger NMI on all other CPUs so they populate their per-CPU slots.
- *   3. Collect the printk tail directly (panic() calls notifiers BEFORE
- *      kmsg_dump, so we must read kmsg here rather than relying on
- *      custom_kmsg_dump_cb which would run too late).
+ *   3. Collect the printk tail directly (panic() may kexec before notifiers
+ *      and kmsg_dump, so this path must not rely on callbacks).
  *   4. Wait up to custom_wait_us µs for all CPUs to respond.
  *   5. Read device registers and assemble the vmcoredd blob.
  */
-void custom_crashdump_capture(struct pt_regs *regs);
 void custom_crashdump_capture(struct pt_regs *regs)
 {
 	u32 cfg40;
@@ -420,18 +465,29 @@ void custom_crashdump_capture(struct pt_regs *regs)
 	u32 io_val;
 	unsigned int seen;
 	unsigned int target_cpus = num_online_cpus();
-	unsigned int max_tries;
-	int tries;
 	struct kmsg_dump_iter iter;
 	size_t out_len = 0;
 
+	/*
+	 * Advance the capture generation before resetting valid bits.  Any NMI
+	 * that fires after this point will tag its slot with the new generation,
+	 * while slots written before the reset still carry the old generation and
+	 * will be excluded by custom_count_captured_cpus() / prepare_blob().
+	 */
+	WRITE_ONCE(custom_capture_generation, READ_ONCE(custom_capture_generation) + 1);
+	custom_reset_capture_valid_bits();
 	custom_nmi_capture(regs);
-	trigger_all_cpu_backtrace();
 
 	/*
-	 * Collect printk tail here, before calling custom_vmcoredd_prepare_blob().
-	 * panic() calls panic notifiers (us) before kmsg_dump(), so
-	 * custom_kmsg_dump_cb() would run too late to populate this buffer.
+	 * Capture the printk tail BEFORE trigger_all_cpu_backtrace().
+	 * trigger_all_cpu_backtrace() causes nmi_cpu_backtrace_handler() to call
+	 * show_regs()/dump_stack() on every CPU, writing N × show_regs() worth
+	 * of data into the printk ring buffer.  If we collect the tail after that,
+	 * the panic message and oops backtrace may have been pushed out of the
+	 * ring buffer on systems with many CPUs.
+	 *
+	 * panic() may call __crash_kexec() before notifiers and kmsg_dump(), so
+	 * this is the only place that reliably captures the full panic context.
 	 */
 	kmsg_dump_rewind(&iter);
 	if (kmsg_dump_get_buffer(&iter, true, custom_printk_tail,
@@ -443,20 +499,27 @@ void custom_crashdump_capture(struct pt_regs *regs)
 		custom_printk_tail_crc = 0;
 	}
 
-	max_tries = custom_wait_us / 10;
-	if (!max_tries)
-		max_tries = 1;
-
-	for (tries = 0; tries < max_tries; tries++) {
-		seen = custom_count_captured_cpus();
-		if (seen >= target_cpus)
-			break;
-		udelay(10);
-	}
+	/*
+	 * Send NMI IPI to all other online CPUs so they populate their per-CPU
+	 * slots via custom_nmi_handler().
+	 *
+	 * nmi_trigger_cpumask_backtrace() (called internally) blocks until all
+	 * target CPUs clear their backtrace_mask bit (via nmi_cpu_backtrace_handler)
+	 * or a 10-second timeout expires.  By the time this returns, custom_nmi_capture()
+	 * has already run on every responding CPU, so no additional polling is needed.
+	 *
+	 * If NMI IPI is unavailable on this arch the function returns false and only
+	 * the panic CPU's snapshot will be present in the blob.
+	 */
+	if (!trigger_all_cpu_backtrace())
+		pr_warn("custom crashdump: NMI backtrace unavailable, only panic CPU captured\n");
 
 	custom_collect_device_values(&cfg40, &mmio_val, &io_val);
 	seen = custom_count_captured_cpus();
-	custom_vmcoredd_prepare_blob(cfg40, mmio_val, io_val, seen);
+	if (seen < target_cpus)
+		pr_warn("custom crashdump: captured cpus=%u/%u (some NMI snapshots missing)\n",
+			seen, target_cpus);
+	custom_vmcoredd_prepare_blob(cfg40, mmio_val, io_val);
 	/*
 	 * vmcoreinfo keys are appended later by custom_vmcoreinfo_extra_append(),
 	 * which is called from crash_save_vmcoreinfo() after vmcoreinfo_data has
@@ -471,7 +534,12 @@ void custom_crashdump_capture(struct pt_regs *regs)
  * switched to the crash-safe copy.  Appends key=value pairs describing the
  * vmcoredd blob location so the 2nd (kdump) kernel can locate it from the
  * ELF PT_NOTE segment in /proc/vmcore.
+ *
+ * The prototype is declared here (rather than in a header) because this is
+ * a __weak override and no shared header includes it.  The declaration
+ * satisfies -Wmissing-prototypes; the __weak stub lives in kernel/vmcore_info.c.
  */
+/* prototype to satisfy -Wmissing-prototypes */
 void custom_vmcoreinfo_extra_append(void);
 void custom_vmcoreinfo_extra_append(void)
 {
@@ -506,8 +574,7 @@ void custom_vmcoreinfo_extra_append(void)
  * Updates custom_vmcoredd_blob_size so the 2nd kernel knows how many bytes
  * to copy via custom_vmcoredd_copy_from_oldmem().
  */
-static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
-					 unsigned int seen)
+static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val)
 {
 	struct custom_vmcoredd_header *hdr;
 	size_t off = sizeof(*hdr);
@@ -522,7 +589,9 @@ static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
 		struct custom_nmi_cpu_state *s;
 
 		s = &per_cpu(custom_nmi_cpu_state, cpu);
-		if (!s->valid)
+		/* Exclude slots from pre-panic or spurious NMIs (wrong generation). */
+		if (!smp_load_acquire(&s->valid) ||
+		    s->capture_gen != custom_capture_generation)
 			continue;
 
 		if (record_count >= CUSTOM_VMCOREDD_MAX_CPUS)
@@ -547,7 +616,11 @@ static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val,
 	hdr->magic = CUSTOM_VMCOREDD_MAGIC;
 	hdr->version = CUSTOM_VMCOREDD_VERSION;
 	hdr->total_size = off + tail_len;
-	hdr->captured_cpus = seen;
+	/* Use record_count (the loop result) as the authoritative captured count.
+	 * This avoids a race where custom_count_captured_cpus() and the loop
+	 * below observe a different number of valid slots.
+	 */
+	hdr->captured_cpus = record_count;
 	hdr->online_cpus = num_online_cpus();
 	hdr->record_count = record_count;
 	hdr->record_size = sizeof(struct custom_vmcoredd_cpu_record);
@@ -762,9 +835,8 @@ static int __init custom_vmcoredd_register(void)
 	u64 size;
 	int ret;
 
-	if (!is_kdump_kernel()) {
+	if (!is_kdump_kernel())
 		return 0;
-	}
 
 	ret = custom_read_vmcoreinfo_from_oldmem(custom_vmcoreinfo_scratch,
 					 sizeof(custom_vmcoreinfo_scratch));
@@ -809,30 +881,29 @@ static int __init custom_vmcoredd_register(void)
 static int custom_nmi_handler(unsigned int val, struct pt_regs *regs)
 {
 	custom_nmi_capture(regs);
+	/*
+	 * Return NMI_DONE (not NMI_HANDLED) so that the "arch_bt" handler
+	 * (nmi_cpu_backtrace_handler, registered by hw_nmi.c) can also run and
+	 * clear this CPU's bit in backtrace_mask.  If we returned NMI_HANDLED,
+	 * the backtrace_mask bit would never be cleared and
+	 * nmi_trigger_cpumask_backtrace() would always time out after 10 seconds.
+	 */
 	return NMI_DONE;
 }
 
 /*
- * Panic notifier called early in the panic() path (priority INT_MAX-1),
- * before smp_send_stop() and before kexec jump.
- * Logs how many CPUs have already been captured by the NMI handler.
- * The actual full capture (printk tail + blob assembly) is handled by
- * custom_crashdump_capture(), which is called from crash_kexec().
+ * Panic notifier: logs that panic has been observed.
+ *
+ * Note: this notifier runs at priority INT_MAX-1, before __crash_kexec()
+ * calls custom_crashdump_capture().  At this point no NMI capture round
+ * has been started yet (custom_capture_generation has not been incremented),
+ * so meaningful per-CPU counts are not available.  The log entry serves only
+ * as a breadcrumb that the notifier chain was reached.
  */
 static int custom_panic_notifier(struct notifier_block *nb,
 					unsigned long action, void *data)
 {
-	struct pt_regs *panic_regs = task_pt_regs(current);
-	unsigned int seen;
-
-	/* Ensure at least the panic CPU context is captured. */
-	if (panic_regs)
-		custom_nmi_capture(panic_regs);
-
-	seen = custom_count_captured_cpus();
-	pr_info("custom crashdump notifier observed cpus=%u/%u\n",
-		seen, num_online_cpus());
-
+	pr_info("custom crashdump: panic observed, NMI capture pending\n");
 	return NOTIFY_DONE;
 }
 
@@ -842,17 +913,26 @@ static struct notifier_block custom_panic_nb = {
 };
 
 /*
- * arch_initcall: register NMI handlers, panic notifier, and kmsg dumper.
+ * arch_initcall: register NMI handlers and panic notifier.
  *
- * Runs during early boot (after PCI probe).  Registers:
+ * Runs during early boot (before PCI probe / device_initcall).  Registers:
  *   - NMI_UNKNOWN + NMI_LOCAL handlers for per-CPU register capture
- *   - panic notifier to log capture status
- *   - kmsg_dump callback for KMSG_DUMP_PANIC (fallback / reference)
+ *   - panic notifier as a breadcrumb that the panic chain was reached
  */
 static int __init custom_crashdump_nmi_init(void)
 {
 	int rc;
 	bool nmi_registered = false;
+
+	/*
+	 * Verify the wire-format layout of custom_nmi_cpu_state.
+	 * bool valid (1 byte) is followed by 1 byte of implicit padding before
+	 * u16 cs.  If the compiler or ABI ever changes this, the Python parser
+	 * (show_vmcoredd.py) will silently misparse every field.
+	 */
+	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, cs) != 2);
+	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, stack_len) !=
+		     offsetof(struct custom_nmi_cpu_state, apic_base) + sizeof(u64));
 
 	if (custom_nmi_handlers) {
 		rc = register_nmi_handler(NMI_UNKNOWN, custom_nmi_handler,
@@ -875,20 +955,6 @@ static int __init custom_crashdump_nmi_init(void)
 
 	rc = atomic_notifier_chain_register(&panic_notifier_list, &custom_panic_nb);
 	if (rc) {
-		if (nmi_registered) {
-			unregister_nmi_handler(NMI_LOCAL,
-						"custom-crashdump-nmi-local");
-			unregister_nmi_handler(NMI_UNKNOWN,
-						"custom-crashdump-nmi-unknown");
-		}
-		return rc;
-	}
-
-	custom_kmsg_dumper.dump = custom_kmsg_dump_cb;
-	custom_kmsg_dumper.max_reason = KMSG_DUMP_PANIC;
-	rc = kmsg_dump_register(&custom_kmsg_dumper);
-	if (rc) {
-		atomic_notifier_chain_unregister(&panic_notifier_list, &custom_panic_nb);
 		if (nmi_registered) {
 			unregister_nmi_handler(NMI_LOCAL,
 						"custom-crashdump-nmi-local");
