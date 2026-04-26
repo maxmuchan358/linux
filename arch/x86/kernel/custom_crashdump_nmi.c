@@ -23,7 +23,6 @@
 #include <linux/cpu.h>
 #include <linux/crash_dump.h>
 #include <linux/crc32.h>
-#include <linux/delay.h>
 #include <linux/elf.h>
 #include <linux/init.h>
 #include <linux/kmsg_dump.h>
@@ -156,10 +155,6 @@ module_param_named(custom_crashdump_nmi_handlers, custom_nmi_handlers, bool, 044
 static unsigned int custom_stack_copy_bytes = CUSTOM_STACK_SNAPSHOT_BYTES;
 module_param_named(custom_crashdump_stack_copy_bytes,
 		   custom_stack_copy_bytes, uint, 0644);
-
-/* How long to wait for all CPUs to respond to NMI before giving up, in µs. */
-static unsigned int custom_wait_us = 500000;
-module_param_named(custom_crashdump_wait_us, custom_wait_us, uint, 0644);
 
 /*
  * Monotonically increasing capture generation.  Incremented once at the start
@@ -452,11 +447,12 @@ static void custom_nmi_capture(struct pt_regs *regs)
  * Called from crash_kexec() before kexec starts.
  * Responsibilities:
  *   1. Capture the panicking CPU's registers via custom_nmi_capture().
- *   2. Trigger NMI on all other CPUs so they populate their per-CPU slots.
- *   3. Collect the printk tail directly (panic() may kexec before notifiers
- *      and kmsg_dump, so this path must not rely on callbacks).
- *   4. Wait up to custom_wait_us µs for all CPUs to respond.
- *   5. Read device registers and assemble the vmcoredd blob.
+ *   2. Capture the printk tail before triggering NMI on other CPUs (see
+ *      comment in function body for why order matters).
+ *   3. Trigger NMI on all other CPUs and wait for them to respond.
+ *      nmi_trigger_cpumask_backtrace() blocks until all CPUs have cleared
+ *      their backtrace_mask bit or a 10-second timeout expires.
+ *   4. Read device registers and assemble the vmcoredd blob.
  */
 void custom_crashdump_capture(struct pt_regs *regs)
 {
@@ -539,8 +535,7 @@ void custom_crashdump_capture(struct pt_regs *regs)
  * a __weak override and no shared header includes it.  The declaration
  * satisfies -Wmissing-prototypes; the __weak stub lives in kernel/vmcore_info.c.
  */
-/* prototype to satisfy -Wmissing-prototypes */
-void custom_vmcoreinfo_extra_append(void);
+void custom_vmcoreinfo_extra_append(void); /* satisfies -Wmissing-prototypes */
 void custom_vmcoreinfo_extra_append(void)
 {
 	struct custom_vmcoredd_header *hdr;
