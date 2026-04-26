@@ -106,6 +106,16 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
 	 * In practice this means shooting down the other cpus in
 	 * an SMP system.
 	 */
+	/*
+	 * Capture per-CPU register state and assemble the vmcoredd blob before
+	 * shooting down other CPUs.  Must run here (arch-specific crash path)
+	 * rather than in the generic crash_core.c so that the hook stays within
+	 * arch/x86 and does not pollute generic kernel headers.
+	 */
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+	custom_crashdump_capture(regs);
+#endif
+
 	/* The kernel is broken so disable interrupts */
 	local_irq_disable();
 

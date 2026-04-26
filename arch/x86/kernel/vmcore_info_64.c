@@ -3,6 +3,7 @@
 #include <linux/vmcore_info.h>
 #include <linux/pgtable.h>
 
+#include <asm/crash.h>
 #include <asm/setup.h>
 
 void arch_crash_save_vmcoreinfo(void)
@@ -22,3 +23,14 @@ void arch_crash_save_vmcoreinfo(void)
 	VMCOREINFO_NUMBER(KERNEL_IMAGE_SIZE);
 	VMCOREINFO_NUMBER(sme_mask);
 }
+
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+void arch_crash_save_vmcoreinfo_late(void)
+{
+	/*
+	 * Append custom vmcoredd blob location keys at crash time, after
+	 * the blob has been assembled in native_machine_crash_shutdown().
+	 */
+	custom_vmcoreinfo_extra_append();
+}
+#endif

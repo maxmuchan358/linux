@@ -23,6 +23,7 @@
 #include <linux/cpu.h>
 #include <linux/crash_dump.h>
 #include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/elf.h>
 #include <linux/init.h>
 #include <linux/kmsg_dump.h>
@@ -40,9 +41,12 @@
 #include <linux/vmalloc.h>
 #include <linux/vmcore_info.h>
 
+#include <asm/apic.h>
 #include <asm/asm.h>
+#include <asm/crash.h>
 #include <asm/debugreg.h>
 #include <asm/io.h>
+#include <asm/irq_vectors.h>
 #include <asm/msr.h>
 #include <asm/nmi.h>
 #include <asm/paravirt.h>
@@ -63,13 +67,13 @@
  * Stored in a per-CPU variable; copied into the vmcoredd blob by
  * custom_vmcoredd_prepare_blob() after all CPUs have responded.
  *
- * Wire-format note: bool valid occupies 1 byte followed by 1 byte of implicit
- * compiler padding before u16 cs.  The layout is fixed; a BUILD_BUG_ON below
- * verifies the offsets so that the Python parser stays in sync.
+ * Wire-format note: bool valid (1 byte) is followed by explicit u8 _pad
+ * (1 byte) before u16 cs.  The layout is fixed; a BUILD_BUG_ON below verifies
+ * the offsets so that the Python parser stays in sync.
  */
 struct custom_nmi_cpu_state {
 	bool valid;
-	/* 1-byte implicit padding here; verified by BUILD_BUG_ON in nmi_init */
+	u8 _pad;           /* explicit padding to align cs to offset 2 */
 	u16 cs;
 	u16 ss;
 	u64 ip;
@@ -213,7 +217,7 @@ static unsigned int custom_count_captured_cpus(void)
 		 * before the store-release), so a plain read is sufficient.
 		 */
 		if (smp_load_acquire(&s->valid) &&
-		    s->capture_gen == custom_capture_generation)
+		    s->capture_gen == READ_ONCE(custom_capture_generation))
 			seen++;
 	}
 
@@ -361,6 +365,16 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	unsigned long dr6 = 0;
 	unsigned long dr7 = 0;
 
+	/*
+	 * Skip re-capture if this CPU already has a valid snapshot for the
+	 * current generation (e.g. a second NMI round for log writing arrives
+	 * after the capture round has completed).  The first snapshot, taken
+	 * closest to the actual panic point, is more useful.
+	 */
+	if (smp_load_acquire(&state->valid) &&
+	    READ_ONCE(state->capture_gen) == READ_ONCE(custom_capture_generation))
+		return;
+
 	rdmsrq_safe(MSR_IA32_APICBASE, &apic_base);
 	get_debugreg(dr6, 6);
 	get_debugreg(dr7, 7);
@@ -417,12 +431,15 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	}
 
 	if (user_sp && user_copy_len) {
-		unsigned long left;
+		unsigned long not_copied;
 		unsigned int copied;
 
-		left = copy_from_user_nmi(state->user_stack_snapshot,
-					 (const void __user *)user_sp, user_copy_len);
-		copied = user_copy_len - left;
+		not_copied = copy_from_user_nmi(state->user_stack_snapshot,
+					       (const void __user *)user_sp,
+					       user_copy_len);
+		/* not_copied <= user_copy_len by contract of copy_from_user_nmi */
+		copied = (not_copied < user_copy_len)
+			 ? (unsigned int)(user_copy_len - not_copied) : 0;
 		if (copied) {
 			state->user_stack_len = copied;
 			state->user_stack_crc = crc32_le(0,
@@ -432,13 +449,42 @@ static void custom_nmi_capture(struct pt_regs *regs)
 	}
 
 	/*
-	 * Tag with the current capture generation before publishing.  The
-	 * store-release on valid ensures capture_gen is visible to any CPU
-	 * that subsequently loads valid with an acquire.
+	 * Tag with the current capture generation before publishing.  Cache
+	 * the generation in a local variable so both the assignment and the
+	 * guard check at the top of the function observe the same value.
+	 * The store-release on valid ensures capture_gen is visible to any
+	 * CPU that subsequently loads valid with an acquire.
 	 */
 	state->capture_gen = READ_ONCE(custom_capture_generation);
 	/* Publish this CPU slot only after all fields are fully populated. */
 	smp_store_release(&state->valid, true);
+}
+
+/*
+ * Send NMI IPI to all CPUs except the current one and poll until all
+ * per-CPU capture slots show valid data for the current generation, or
+ * the 10-second timeout expires.
+ *
+ * Uses apic_send_IPI_allbutself() directly rather than going through
+ * trigger_all_cpu_backtrace(), so that the NMI dispatch step is
+ * clearly separated from the log-writing step performed below.
+ */
+static void custom_nmi_dispatch_and_wait(void)
+{
+	unsigned int target = num_online_cpus();
+	unsigned int i;
+
+	if (target <= 1)
+		return;
+
+	apic_send_IPI_allbutself(NMI_VECTOR);
+
+	/* Wait up to 10 seconds (10 000 × 1 ms) for all CPUs to respond. */
+	for (i = 0; i < 10 * 1000U; i++) {
+		if (custom_count_captured_cpus() >= target)
+			break;
+		udelay(1000);
+	}
 }
 
 /*
@@ -450,8 +496,6 @@ static void custom_nmi_capture(struct pt_regs *regs)
  *   2. Capture the printk tail before triggering NMI on other CPUs (see
  *      comment in function body for why order matters).
  *   3. Trigger NMI on all other CPUs and wait for them to respond.
- *      nmi_trigger_cpumask_backtrace() blocks until all CPUs have cleared
- *      their backtrace_mask bit or a 10-second timeout expires.
  *   4. Read device registers and assemble the vmcoredd blob.
  */
 void custom_crashdump_capture(struct pt_regs *regs)
@@ -459,7 +503,6 @@ void custom_crashdump_capture(struct pt_regs *regs)
 	u32 cfg40;
 	u32 mmio_val;
 	u32 io_val;
-	unsigned int seen;
 	unsigned int target_cpus = num_online_cpus();
 	struct kmsg_dump_iter iter;
 	size_t out_len = 0;
@@ -495,45 +538,55 @@ void custom_crashdump_capture(struct pt_regs *regs)
 		custom_printk_tail_crc = 0;
 	}
 
-	/*
-	 * Send NMI IPI to all other online CPUs so they populate their per-CPU
-	 * slots via custom_nmi_handler().
-	 *
-	 * nmi_trigger_cpumask_backtrace() (called internally) blocks until all
-	 * target CPUs clear their backtrace_mask bit (via nmi_cpu_backtrace_handler)
-	 * or a 10-second timeout expires.  By the time this returns, custom_nmi_capture()
-	 * has already run on every responding CPU, so no additional polling is needed.
-	 *
-	 * If NMI IPI is unavailable on this arch the function returns false and only
-	 * the panic CPU's snapshot will be present in the blob.
-	 */
-	if (!trigger_all_cpu_backtrace())
-		pr_warn("custom crashdump: NMI backtrace unavailable, only panic CPU captured\n");
+	if (custom_nmi_handlers) {
+		/*
+		 * Step 1 – per-CPU register capture:
+		 * Send NMI IPI directly via the APIC and poll for all CPUs to respond.
+		 * This is intentionally separate from the log-writing step below so that
+		 * the purpose of each NMI round is explicit and
+		 * trigger_all_cpu_backtrace() is not misused as a mere IPI dispatch
+		 * mechanism.
+		 */
+		custom_nmi_dispatch_and_wait();
+
+		{
+			unsigned int seen = custom_count_captured_cpus();
+
+			if (seen < target_cpus)
+				pr_warn("custom crashdump: captured cpus=%u/%u (some NMI snapshots missing)\n",
+					seen, target_cpus);
+		}
+
+		/*
+		 * Step 2 – per-CPU backtrace in printk log:
+		 * trigger_all_cpu_backtrace() sends a second NMI round whose explicit
+		 * purpose is to print show_regs()/dump_stack() for each CPU into the
+		 * kernel log.  The re-capture guard in custom_nmi_capture() ensures
+		 * that this NMI round does not overwrite the panic-point snapshots taken
+		 * above.
+		 */
+		trigger_all_cpu_backtrace();
+	} else {
+		pr_info("custom crashdump: NMI handlers disabled, capturing panic CPU only\n");
+	}
 
 	custom_collect_device_values(&cfg40, &mmio_val, &io_val);
-	seen = custom_count_captured_cpus();
-	if (seen < target_cpus)
-		pr_warn("custom crashdump: captured cpus=%u/%u (some NMI snapshots missing)\n",
-			seen, target_cpus);
 	custom_vmcoredd_prepare_blob(cfg40, mmio_val, io_val);
 	/*
 	 * vmcoreinfo keys are appended later by custom_vmcoreinfo_extra_append(),
-	 * which is called from crash_save_vmcoreinfo() after vmcoreinfo_data has
-	 * been switched to the safe copy.  This ensures the keys survive into the
-	 * ELF note that the 2nd (kdump) kernel reads via elfcorehdr.
+	 * which is called from arch_crash_save_vmcoreinfo_late() after
+	 * vmcoreinfo_data has been switched to the safe copy.  This ensures the
+	 * keys survive into the ELF note that the 2nd (kdump) kernel reads via
+	 * elfcorehdr.
 	 */
 }
 
 /*
- * Override the weak stub in kernel/vmcore_info.c.
- * Called from crash_save_vmcoreinfo() after the vmcoreinfo buffer has been
- * switched to the crash-safe copy.  Appends key=value pairs describing the
- * vmcoredd blob location so the 2nd (kdump) kernel can locate it from the
- * ELF PT_NOTE segment in /proc/vmcore.
- *
- * The prototype is declared here (rather than in a header) because this is
- * a __weak override and no shared header includes it.  The declaration
- * satisfies -Wmissing-prototypes; the __weak stub lives in kernel/vmcore_info.c.
+ * Called from arch_crash_save_vmcoreinfo_late() during crash_save_vmcoreinfo()
+ * after the vmcoreinfo buffer has been switched to the crash-safe copy.
+ * Appends key=value pairs describing the vmcoredd blob location so the
+ * 2nd (kdump) kernel can locate it from the ELF PT_NOTE segment in
+ * /proc/vmcore.
  */
 void custom_vmcoreinfo_extra_append(void); /* satisfies -Wmissing-prototypes */
 void custom_vmcoreinfo_extra_append(void)
@@ -586,7 +639,7 @@ static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val)
 		s = &per_cpu(custom_nmi_cpu_state, cpu);
 		/* Exclude slots from pre-panic or spurious NMIs (wrong generation). */
 		if (!smp_load_acquire(&s->valid) ||
-		    s->capture_gen != custom_capture_generation)
+		    s->capture_gen != READ_ONCE(custom_capture_generation))
 			continue;
 
 		if (record_count >= CUSTOM_VMCOREDD_MAX_CPUS)
@@ -684,6 +737,7 @@ static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 			break;
 
 		if (note->n_type == 0 &&
+		    note->n_descsz > 0 &&
 		    note->n_namesz == sizeof(VMCOREINFO_NOTE_NAME) &&
 		    !memcmp(notes + name_off, VMCOREINFO_NOTE_NAME,
 			    sizeof(VMCOREINFO_NOTE_NAME))) {
@@ -701,6 +755,48 @@ static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 }
 
 /*
+ * Recover the original elfcorehdr physical address from kernel cmdline.
+ *
+ * The format accepted by elfcorehdr= is either:
+ *   elfcorehdr=<addr>
+ *   elfcorehdr=<size>@<addr>
+ */
+static int custom_get_elfcorehdr_addr_from_cmdline(u64 *addr)
+{
+	const char *arg;
+	const char *scan;
+	char *end;
+	u64 val;
+
+	arg = NULL;
+	for (scan = saved_command_line; (scan = strstr(scan, "elfcorehdr=")); scan++) {
+		if (scan == saved_command_line || *(scan - 1) == ' ') {
+			arg = scan;
+			break;
+		}
+	}
+	if (!arg)
+		return -ENOENT;
+
+	arg += strlen("elfcorehdr=");
+	val = memparse(arg, &end);
+	if (end == arg)
+		return -EINVAL;
+	if (end && *end == '@') {
+		const char *addr_start = end + 1;
+
+		val = memparse(addr_start, &end);
+		if (end == addr_start)
+			return -EINVAL;
+	}
+	if (!val)
+		return -EINVAL;
+
+	*addr = val;
+	return 0;
+}
+
+/*
  * Read the vmcoreinfo ELF note from the 1st kernel's ELF core header
  * (accessible via elfcorehdr_addr in the 2nd kernel).
  * Only ELF64 format is supported; returns -EINVAL for ELF32.
@@ -708,8 +804,28 @@ static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 static int custom_read_vmcoreinfo_from_oldmem(char *out, size_t out_sz)
 {
 	unsigned char ident[EI_NIDENT];
-	u64 pos = elfcorehdr_addr;
+	u64 hdr_addr = elfcorehdr_addr;
+	u64 pos;
 	int ret;
+
+	if (hdr_addr == ELFCORE_ADDR_ERR || hdr_addr == ELFCORE_ADDR_MAX) {
+		/*
+		 * vmcore_init() may invalidate elfcorehdr_addr after consuming
+		 * the header.  Fall back to the raw cmdline value.
+		 */
+		ret = custom_get_elfcorehdr_addr_from_cmdline(&hdr_addr);
+		if (ret) {
+			pr_debug("custom crashdump: elfcorehdr not available from elfcorehdr_addr or cmdline\n");
+			return ret;
+		}
+		pr_debug("custom crashdump: using elfcorehdr addr from cmdline: %#llx\n",
+			 hdr_addr);
+	}
+
+	if (!hdr_addr || hdr_addr == ELFCORE_ADDR_MAX || hdr_addr == ELFCORE_ADDR_ERR)
+		return -EINVAL;
+
+	pos = hdr_addr;
 
 	ret = elfcorehdr_read(ident, sizeof(ident), &pos);
 	if (ret < 0)
@@ -722,16 +838,19 @@ static int custom_read_vmcoreinfo_from_oldmem(char *out, size_t out_sz)
 		Elf64_Phdr *phdrs;
 		int i;
 
-		pos = elfcorehdr_addr;
+		pos = hdr_addr;
 		ret = elfcorehdr_read((char *)&ehdr, sizeof(ehdr), &pos);
 		if (ret < 0)
 			return ret;
+
+		if (!ehdr.e_phnum)
+			return -ENOENT;
 
 		phdrs = vmalloc(array_size(ehdr.e_phnum, sizeof(*phdrs)));
 		if (!phdrs)
 			return -ENOMEM;
 
-		pos = elfcorehdr_addr + ehdr.e_phoff;
+		pos = hdr_addr + ehdr.e_phoff;
 		ret = elfcorehdr_read((char *)phdrs,
 				     ehdr.e_phnum * sizeof(*phdrs), &pos);
 		if (ret < 0)
@@ -773,6 +892,7 @@ out_free_64:
 		return ret;
 	}
 
+	pr_err("custom crashdump: ELF32 elfcorehdr not supported\n");
 	return -EINVAL;
 }
 
@@ -818,11 +938,13 @@ static int custom_vmcoredd_copy_from_oldmem(struct vmcoredd_data *data, void *bu
  * ELF note that the 1st kernel embedded in elfcorehdr.  Those values point
  * to the blob assembled by custom_vmcoredd_prepare_blob() in the 1st kernel.
  *
- * Note: is_kdump_kernel() is used instead of is_vmcore_usable() because
- * vmcore_init() (fs_initcall) sets elfcorehdr_addr = ELFCORE_ADDR_ERR on
- * success, which makes is_vmcore_usable() return false at late_initcall time.
- * is_kdump_kernel() only checks that elfcorehdr_addr != ELFCORE_ADDR_MAX and
- * is therefore correct here.
+ * Note: is_kdump_kernel() is used instead of is_vmcore_usable().
+ * vmcore_init() may set elfcorehdr_addr = ELFCORE_ADDR_ERR after consuming
+ * elfcorehdr; custom_read_vmcoreinfo_from_oldmem() handles that by falling
+ * back to parsing "elfcorehdr=" from saved_command_line.
+ *
+ * late_initcall is kept so vmcore_add_device_dump() runs after vmcore
+ * subsystem initialization.
  */
 static int __init custom_vmcoredd_register(void)
 {
@@ -921,10 +1043,11 @@ static int __init custom_crashdump_nmi_init(void)
 
 	/*
 	 * Verify the wire-format layout of custom_nmi_cpu_state.
-	 * bool valid (1 byte) is followed by 1 byte of implicit padding before
-	 * u16 cs.  If the compiler or ABI ever changes this, the Python parser
-	 * (show_vmcoredd.py) will silently misparse every field.
+	 * bool valid (1 byte) + u8 _pad (1 byte) puts u16 cs at offset 2.
+	 * If the struct layout ever changes, the Python parser (show_vmcoredd.py)
+	 * will silently misparse every field, so we enforce the offsets here.
 	 */
+	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, _pad) != 1);
 	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, cs) != 2);
 	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, stack_len) !=
 		     offsetof(struct custom_nmi_cpu_state, apic_base) + sizeof(u64));

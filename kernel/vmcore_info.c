@@ -72,13 +72,14 @@ void crash_update_vmcoreinfo_safecopy(void *ptr)
 	vmcoreinfo_data_safecopy = ptr;
 }
 
-
 /*
- * Hook called from crash_save_vmcoreinfo() after vmcoreinfo_data has been
- * switched to the safe copy.  Architecture/platform code may override this
- * weak stub to append extra keys that must survive into the ELF note.
+ * Optional architecture hook for crash-time dynamic vmcoreinfo keys.
+ * Called from crash_save_vmcoreinfo() after switching to safe copy.
  */
-void __weak custom_vmcoreinfo_extra_append(void) {}
+void __weak arch_crash_save_vmcoreinfo_late(void)
+{
+}
+
 
 void crash_save_vmcoreinfo(void)
 {
@@ -89,7 +90,8 @@ void crash_save_vmcoreinfo(void)
 	if (vmcoreinfo_data_safecopy)
 		vmcoreinfo_data = vmcoreinfo_data_safecopy;
 
-	custom_vmcoreinfo_extra_append();
+	arch_crash_save_vmcoreinfo_late();
+
 	vmcoreinfo_append_str("CRASHTIME=%lld\n", ktime_get_real_seconds());
 	update_vmcoreinfo_note();
 }

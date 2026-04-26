@@ -42,10 +42,6 @@ note_buf_t __percpu *crash_notes;
 
 #ifdef CONFIG_CRASH_DUMP
 
-void __weak custom_crashdump_capture(struct pt_regs *regs)
-{
-}
-
 int kimage_crash_copy_vmcoreinfo(struct kimage *image)
 {
 	struct page *vmcoreinfo_page;
@@ -136,9 +132,8 @@ void __noclone __crash_kexec(struct pt_regs *regs)
 			struct pt_regs fixed_regs;
 
 			crash_setup_regs(&fixed_regs, regs);
-			custom_crashdump_capture(&fixed_regs);
-			crash_save_vmcoreinfo();
 			machine_crash_shutdown(&fixed_regs);
+			crash_save_vmcoreinfo();
 			crash_cma_clear_pending_dma();
 			machine_kexec(kexec_crash_image);
 		}
