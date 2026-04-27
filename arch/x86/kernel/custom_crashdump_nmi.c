@@ -191,6 +191,8 @@ static u8 custom_vmcoredd_blob[CUSTOM_VMCOREDD_BLOB_BYTES];
 static size_t custom_vmcoredd_blob_size;
 static u64 custom_vmcoredd_oldmem_paddr;
 static unsigned int custom_vmcoredd_oldmem_size;
+/* Cached early in 2nd kernel before vmcore_init() invalidates elfcorehdr_addr. */
+static u64 custom_cached_elfcorehdr_addr = ELFCORE_ADDR_MAX;
 static char custom_vmcoreinfo_scratch[VMCOREINFO_BYTES + 1];
 
 static void custom_vmcoredd_prepare_blob(u32 cfg40, u32 mmio_val, u32 io_val);
@@ -755,48 +757,6 @@ static bool custom_find_vmcoreinfo_in_notes(void *notes, size_t notes_size,
 }
 
 /*
- * Recover the original elfcorehdr physical address from kernel cmdline.
- *
- * The format accepted by elfcorehdr= is either:
- *   elfcorehdr=<addr>
- *   elfcorehdr=<size>@<addr>
- */
-static int custom_get_elfcorehdr_addr_from_cmdline(u64 *addr)
-{
-	const char *arg;
-	const char *scan;
-	char *end;
-	u64 val;
-
-	arg = NULL;
-	for (scan = saved_command_line; (scan = strstr(scan, "elfcorehdr=")); scan++) {
-		if (scan == saved_command_line || *(scan - 1) == ' ') {
-			arg = scan;
-			break;
-		}
-	}
-	if (!arg)
-		return -ENOENT;
-
-	arg += strlen("elfcorehdr=");
-	val = memparse(arg, &end);
-	if (end == arg)
-		return -EINVAL;
-	if (end && *end == '@') {
-		const char *addr_start = end + 1;
-
-		val = memparse(addr_start, &end);
-		if (end == addr_start)
-			return -EINVAL;
-	}
-	if (!val)
-		return -EINVAL;
-
-	*addr = val;
-	return 0;
-}
-
-/*
  * Read the vmcoreinfo ELF note from the 1st kernel's ELF core header
  * (accessible via elfcorehdr_addr in the 2nd kernel).
  * Only ELF64 format is supported; returns -EINVAL for ELF32.
@@ -804,22 +764,21 @@ static int custom_get_elfcorehdr_addr_from_cmdline(u64 *addr)
 static int custom_read_vmcoreinfo_from_oldmem(char *out, size_t out_sz)
 {
 	unsigned char ident[EI_NIDENT];
-	u64 hdr_addr = elfcorehdr_addr;
+	u64 hdr_addr = READ_ONCE(custom_cached_elfcorehdr_addr);
 	u64 pos;
 	int ret;
 
+	/*
+	 * vmcore_init() may invalidate elfcorehdr_addr after consuming the
+	 * header. Prefer the early cached value; only fall back to the live
+	 * variable if this function runs before cache initialization.
+	 */
+	if (hdr_addr == ELFCORE_ADDR_ERR || hdr_addr == ELFCORE_ADDR_MAX)
+		hdr_addr = READ_ONCE(elfcorehdr_addr);
+
 	if (hdr_addr == ELFCORE_ADDR_ERR || hdr_addr == ELFCORE_ADDR_MAX) {
-		/*
-		 * vmcore_init() may invalidate elfcorehdr_addr after consuming
-		 * the header.  Fall back to the raw cmdline value.
-		 */
-		ret = custom_get_elfcorehdr_addr_from_cmdline(&hdr_addr);
-		if (ret) {
-			pr_debug("custom crashdump: elfcorehdr not available from elfcorehdr_addr or cmdline\n");
-			return ret;
-		}
-		pr_debug("custom crashdump: using elfcorehdr addr from cmdline: %#llx\n",
-			 hdr_addr);
+		pr_debug("custom crashdump: elfcorehdr not available\n");
+		return -ENOENT;
 	}
 
 	if (!hdr_addr || hdr_addr == ELFCORE_ADDR_MAX || hdr_addr == ELFCORE_ADDR_ERR)
@@ -940,8 +899,8 @@ static int custom_vmcoredd_copy_from_oldmem(struct vmcoredd_data *data, void *bu
  *
  * Note: is_kdump_kernel() is used instead of is_vmcore_usable().
  * vmcore_init() may set elfcorehdr_addr = ELFCORE_ADDR_ERR after consuming
- * elfcorehdr; custom_read_vmcoreinfo_from_oldmem() handles that by falling
- * back to parsing "elfcorehdr=" from saved_command_line.
+ * elfcorehdr; custom_read_vmcoreinfo_from_oldmem() handles that by using the
+ * early cached header address captured in custom_crashdump_nmi_init().
  *
  * late_initcall is kept so vmcore_add_device_dump() runs after vmcore
  * subsystem initialization.
@@ -1051,6 +1010,13 @@ static int __init custom_crashdump_nmi_init(void)
 	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, cs) != 2);
 	BUILD_BUG_ON(offsetof(struct custom_nmi_cpu_state, stack_len) !=
 		     offsetof(struct custom_nmi_cpu_state, apic_base) + sizeof(u64));
+
+	/*
+	 * Cache elfcorehdr early in the 2nd kernel before vmcore_init() may
+	 * invalidate elfcorehdr_addr after parsing crash ELF headers.
+	 */
+	if (is_kdump_kernel() && is_vmcore_usable())
+		WRITE_ONCE(custom_cached_elfcorehdr_addr, elfcorehdr_addr);
 
 	if (custom_nmi_handlers) {
 		rc = register_nmi_handler(NMI_UNKNOWN, custom_nmi_handler,
