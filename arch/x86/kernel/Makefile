@@ -147,6 +147,7 @@ obj-$(CONFIG_X86_UMIP)			+= umip.o
 obj-$(CONFIG_UNWINDER_ORC)		+= unwind_orc.o
 obj-$(CONFIG_UNWINDER_FRAME_POINTER)	+= unwind_frame.o
 obj-$(CONFIG_UNWINDER_GUESS)		+= unwind_guess.o
+obj-$(CONFIG_X86_64)			+= custom_crashdump.o
 
 obj-$(CONFIG_CFI)			+= cfi.o
 

@@ -66,6 +66,13 @@ extern int crash_exclude_mem_range(struct crash_mem *mem,
 				   unsigned long long mend);
 extern int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
 				       void **addr, unsigned long *sz);
+unsigned int arch_crash_extra_vmcore_notes(void);
+unsigned int arch_crash_extra_vmcore_loads(void);
+unsigned int arch_crash_append_vmcore_notes(Elf64_Phdr *phdr,
+					    unsigned int max_phdrs);
+unsigned int arch_crash_append_vmcore_loads(Elf64_Phdr *phdr,
+					    unsigned int max_phdrs);
+int arch_crash_exclude_extra_ranges(struct crash_mem *mem);
 
 struct kimage;
 struct kexec_segment;

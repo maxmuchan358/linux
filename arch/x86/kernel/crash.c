@@ -218,6 +218,10 @@ static int elf_header_exclude_ranges(struct crash_mem *cmem)
 			return ret;
 	}
 
+	ret = arch_crash_exclude_extra_ranges(cmem);
+	if (ret)
+		return ret;
+
 	return 0;
 }
 

@@ -161,6 +161,33 @@ static inline resource_size_t crash_resource_size(const struct resource *res)
 	return !res->end ? 0 : resource_size(res);
 }
 
+unsigned int __weak arch_crash_extra_vmcore_notes(void)
+{
+	return 0;
+}
+
+unsigned int __weak arch_crash_extra_vmcore_loads(void)
+{
+	return 0;
+}
+
+unsigned int __weak arch_crash_append_vmcore_notes(Elf64_Phdr *phdr,
+					   unsigned int max_phdrs)
+{
+	return 0;
+}
+
+unsigned int __weak arch_crash_append_vmcore_loads(Elf64_Phdr *phdr,
+					   unsigned int max_phdrs)
+{
+	return 0;
+}
+
+int __weak arch_crash_exclude_extra_ranges(struct crash_mem *mem)
+{
+	return 0;
+}
+
 
 
 
@@ -171,12 +198,14 @@ int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
 	Elf64_Phdr *phdr;
 	unsigned long nr_cpus = num_possible_cpus(), nr_phdr, elf_sz;
 	unsigned char *buf;
-	unsigned int cpu, i;
+	unsigned int cpu, i, extra_phdrs;
+	unsigned int extra_note_phdrs = arch_crash_extra_vmcore_notes();
+	unsigned int extra_load_phdrs = arch_crash_extra_vmcore_loads();
 	unsigned long long notes_addr;
 	unsigned long mstart, mend;
 
 	/* extra phdr for vmcoreinfo ELF note */
-	nr_phdr = nr_cpus + 1;
+	nr_phdr = nr_cpus + 1 + extra_note_phdrs + extra_load_phdrs;
 	nr_phdr += mem->nr_ranges;
 
 	/*
@@ -227,6 +256,10 @@ int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
 	(ehdr->e_phnum)++;
 	phdr++;
 
+	extra_phdrs = arch_crash_append_vmcore_notes(phdr, extra_note_phdrs);
+	ehdr->e_phnum += extra_phdrs;
+	phdr += extra_phdrs;
+
 	/* Prepare PT_LOAD type program header for kernel text region */
 	if (need_kernel_map) {
 		phdr->p_type = PT_LOAD;
@@ -237,6 +270,10 @@ int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
 		ehdr->e_phnum++;
 		phdr++;
 	}
+
+	extra_phdrs = arch_crash_append_vmcore_loads(phdr, extra_load_phdrs);
+	ehdr->e_phnum += extra_phdrs;
+	phdr += extra_phdrs;
 
 	/* Go through all the ranges in mem->ranges[] and prepare phdr */
 	for (i = 0; i < mem->nr_ranges; i++) {
