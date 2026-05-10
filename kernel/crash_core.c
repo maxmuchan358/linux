@@ -25,6 +25,7 @@
 #include <linux/panic.h>
 
 #include <asm/page.h>
+#include <asm/crash.h>
 #include <asm/sections.h>
 
 #include <crypto/sha1.h>
@@ -132,8 +133,11 @@ void __noclone __crash_kexec(struct pt_regs *regs)
 			struct pt_regs fixed_regs;
 
 			crash_setup_regs(&fixed_regs, regs);
-			crash_save_vmcoreinfo();
 			machine_crash_shutdown(&fixed_regs);
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+			custom_crashdump_capture();
+#endif
+			crash_save_vmcoreinfo();
 			crash_cma_clear_pending_dma();
 			machine_kexec(kexec_crash_image);
 		}
@@ -155,7 +159,6 @@ __bpf_kfunc void crash_kexec(struct pt_regs *regs)
 		panic_reset();
 	}
 }
-
 static inline resource_size_t crash_resource_size(const struct resource *res)
 {
 	return !res->end ? 0 : resource_size(res);

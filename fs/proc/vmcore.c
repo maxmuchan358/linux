@@ -760,7 +760,11 @@ static int __init update_note_header_size_elf64(const Elf64_Ehdr *ehdr_ptr)
 			return rc;
 		}
 		nhdr_ptr = notes_section;
-		while (nhdr_ptr->n_namesz != 0) {
+		while ((real_sz + sizeof(*nhdr_ptr)) <= max_sz) {
+			if (!nhdr_ptr->n_namesz && !nhdr_ptr->n_descsz &&
+			    !nhdr_ptr->n_type)
+				break;
+
 			sz = sizeof(Elf64_Nhdr) +
 				(((u64)nhdr_ptr->n_namesz + 3) & ~3) +
 				(((u64)nhdr_ptr->n_descsz + 3) & ~3);
@@ -772,6 +776,8 @@ static int __init update_note_header_size_elf64(const Elf64_Ehdr *ehdr_ptr)
 			real_sz += sz;
 			nhdr_ptr = (Elf64_Nhdr*)((char*)nhdr_ptr + sz);
 		}
+		if ((real_sz + sizeof(*nhdr_ptr)) > max_sz)
+			pr_warn("Warning: Unterminated PT_NOTE segment encountered\n");
 		kfree(notes_section);
 		phdr_ptr->p_memsz = real_sz;
 		if (real_sz == 0) {
@@ -951,7 +957,11 @@ static int __init update_note_header_size_elf32(const Elf32_Ehdr *ehdr_ptr)
 			return rc;
 		}
 		nhdr_ptr = notes_section;
-		while (nhdr_ptr->n_namesz != 0) {
+		while ((real_sz + sizeof(*nhdr_ptr)) <= max_sz) {
+			if (!nhdr_ptr->n_namesz && !nhdr_ptr->n_descsz &&
+			    !nhdr_ptr->n_type)
+				break;
+
 			sz = sizeof(Elf32_Nhdr) +
 				(((u64)nhdr_ptr->n_namesz + 3) & ~3) +
 				(((u64)nhdr_ptr->n_descsz + 3) & ~3);
@@ -963,6 +973,8 @@ static int __init update_note_header_size_elf32(const Elf32_Ehdr *ehdr_ptr)
 			real_sz += sz;
 			nhdr_ptr = (Elf32_Nhdr*)((char*)nhdr_ptr + sz);
 		}
+		if ((real_sz + sizeof(*nhdr_ptr)) > max_sz)
+			pr_warn("Warning: Unterminated PT_NOTE segment encountered\n");
 		kfree(notes_section);
 		phdr_ptr->p_memsz = real_sz;
 		if (real_sz == 0) {

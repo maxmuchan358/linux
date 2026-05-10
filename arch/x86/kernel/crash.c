@@ -55,6 +55,10 @@ struct crash_memmap_data {
 static void kdump_nmi_callback(int cpu, struct pt_regs *regs)
 {
 	crash_save_cpu(regs, cpu);
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+	custom_crashdump_save_cpu(regs, cpu,
+				     in_nmi() ? CUSTOM_CONTEXT_SOURCE_NMI : CUSTOM_CONTEXT_SOURCE_IPI);
+#endif
 
 	/*
 	 * Disable Intel PT to stop its logging
@@ -110,6 +114,11 @@ void native_machine_crash_shutdown(struct pt_regs *regs)
 	local_irq_disable();
 
 	crash_smp_send_stop();
+
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+	custom_crashdump_save_cpu(regs, smp_processor_id(),
+				 CUSTOM_CONTEXT_SOURCE_EXCEPTION);
+#endif
 
 	cpu_emergency_disable_virtualization();
 
@@ -233,7 +242,69 @@ static int prepare_elf64_ram_headers_callback(struct resource *res, void *arg)
 }
 
 /* Prepare elf headers. Return addr and size */
-static int prepare_elf_headers(void **addr, unsigned long *sz,
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+static int append_custom_note_header(void **addr, unsigned long *sz)
+{
+	Elf64_Ehdr *ehdr = *addr;
+	Elf64_Phdr *phdrs;
+	unsigned int phnum;
+	unsigned int insert_idx;
+	unsigned long needed_sz;
+	phys_addr_t note_paddr;
+	size_t note_size;
+	void *new_buf;
+	Elf64_Phdr *phdr;
+
+	note_paddr = custom_crash_note_paddr();
+	note_size = custom_crash_note_reserved_size();
+	if (!note_paddr || !note_size)
+		return 0;
+
+	phnum = ehdr->e_phnum;
+	needed_sz = sizeof(*ehdr) + (phnum + 1) * sizeof(*phdr);
+	needed_sz = ALIGN(needed_sz, ELF_CORE_HEADER_ALIGN);
+	if (needed_sz > *sz) {
+		new_buf = vzalloc(needed_sz);
+		if (!new_buf)
+			return -ENOMEM;
+		memcpy(new_buf, *addr, *sz);
+		vfree(*addr);
+		*addr = new_buf;
+		*sz = needed_sz;
+		ehdr = *addr;
+	}
+
+	phdrs = (Elf64_Phdr *)(ehdr + 1);
+	for (insert_idx = 0; insert_idx < phnum; insert_idx++) {
+		if (phdrs[insert_idx].p_type != PT_NOTE)
+			break;
+	}
+
+	if (insert_idx < phnum)
+		memmove(&phdrs[insert_idx + 1], &phdrs[insert_idx],
+			(phnum - insert_idx) * sizeof(*phdr));
+
+	phdr = &phdrs[insert_idx];
+	memset(phdr, 0, sizeof(*phdr));
+	phdr->p_type = PT_NOTE;
+	phdr->p_offset = note_paddr;
+	phdr->p_paddr = note_paddr;
+	phdr->p_filesz = note_size;
+	phdr->p_memsz = note_size;
+	phdr->p_align = 4;
+	ehdr->e_phnum++;
+
+	return 0;
+}
+#else
+static int append_custom_note_header(void **addr, unsigned long *sz)
+{
+	return 0;
+}
+#endif
+
+static int prepare_elf_headers(struct kimage *image, void **addr,
+			       unsigned long *sz,
 			       unsigned long *nr_mem_ranges)
 {
 	struct crash_mem *cmem;
@@ -256,7 +327,10 @@ static int prepare_elf_headers(void **addr, unsigned long *sz,
 	*nr_mem_ranges = cmem->nr_ranges;
 
 	/* By default prepare 64bit headers */
-	ret = crash_prepare_elf64_headers(cmem, IS_ENABLED(CONFIG_X86_64), addr, sz);
+	ret = crash_prepare_elf64_headers(cmem, IS_ENABLED(CONFIG_X86_64),
+					 addr, sz);
+	if (!ret)
+		ret = append_custom_note_header(addr, sz);
 
 out:
 	vfree(cmem);
@@ -418,7 +492,7 @@ int crash_load_segments(struct kimage *image)
 				  .buf_max = ULONG_MAX, .top_down = false };
 
 	/* Prepare elf headers and add a segment */
-	ret = prepare_elf_headers(&kbuf.buffer, &kbuf.bufsz, &pnum);
+	ret = prepare_elf_headers(image, &kbuf.buffer, &kbuf.bufsz, &pnum);
 	if (ret)
 		return ret;
 
@@ -427,14 +501,18 @@ int crash_load_segments(struct kimage *image)
 	kbuf.memsz		= kbuf.bufsz;
 
 #ifdef CONFIG_CRASH_HOTPLUG
+	unsigned int extra_notes = IS_ENABLED(CONFIG_CUSTOM_CRASHDUMP_NMI) ? 1 : 0;
+
 	/*
-	 * The elfcorehdr segment size accounts for VMCOREINFO, kernel_map,
-	 * maximum CPUs and maximum memory ranges.
+	 * The elfcorehdr segment size accounts for VMCOREINFO, arch extra notes,
+	 * kernel_map, maximum CPUs and maximum memory ranges.
 	 */
 	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
-		pnum = 2 + CONFIG_NR_CPUS_DEFAULT + CONFIG_CRASH_MAX_MEMORY_RANGES;
+		pnum = 2 + extra_notes +
+			CONFIG_NR_CPUS_DEFAULT + CONFIG_CRASH_MAX_MEMORY_RANGES;
 	else
-		pnum += 2 + CONFIG_NR_CPUS_DEFAULT;
+		pnum += 2 + extra_notes +
+			CONFIG_NR_CPUS_DEFAULT;
 
 	if (pnum < (unsigned long)PN_XNUM) {
 		kbuf.memsz = pnum * sizeof(Elf64_Phdr);
@@ -491,9 +569,10 @@ int arch_crash_hotplug_support(struct kimage *image, unsigned long kexec_flags)
 unsigned int arch_crash_get_elfcorehdr_size(void)
 {
 	unsigned int sz;
+	unsigned int extra_notes = IS_ENABLED(CONFIG_CUSTOM_CRASHDUMP_NMI) ? 1 : 0;
 
-	/* kernel_map, VMCOREINFO and maximum CPUs */
-	sz = 2 + CONFIG_NR_CPUS_DEFAULT;
+	/* kernel_map, VMCOREINFO, arch extra notes and maximum CPUs */
+	sz = 2 + extra_notes + CONFIG_NR_CPUS_DEFAULT;
 	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
 		sz += CONFIG_CRASH_MAX_MEMORY_RANGES;
 	sz *= sizeof(Elf64_Phdr);
@@ -529,7 +608,7 @@ void arch_crash_handle_hotplug_event(struct kimage *image, void *arg)
 	 * Create the new elfcorehdr reflecting the changes to CPU and/or
 	 * memory resources.
 	 */
-	if (prepare_elf_headers(&elfbuf, &elfsz, &nr_mem_ranges)) {
+	if (prepare_elf_headers(image, &elfbuf, &elfsz, &nr_mem_ranges)) {
 		pr_err("unable to create new elfcorehdr");
 		goto out;
 	}

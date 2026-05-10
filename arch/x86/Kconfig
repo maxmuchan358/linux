@@ -2012,6 +2012,28 @@ config ARCH_SUPPORTS_CRASH_DUMP
 config ARCH_DEFAULT_CRASH_DUMP
 	def_bool y
 
+config CUSTOM_CRASHDUMP_NMI
+	bool "Custom crash metadata note in vmcore (x86-64)"
+	depends on CRASH_DUMP && X86_64
+	help
+	  Store custom device state in an extra PT_NOTE inside the standard
+	  /proc/vmcore output. CPU register state and panic logs are left to
+	  the native kdump/vmcore path. The capture tool (show_vmcoredd.py)
+	  can extract and decode the custom note from vmcore.
+
+	  If unsure, say N.
+
+config CUSTOM_CRASHDUMP_NMI_TEST_DEV
+	bool "Custom crash dump: QEMU test PCI device (vendor=0x1d5f/device=0xcafe)"
+	depends on CUSTOM_CRASHDUMP_NMI && PCI
+	help
+	  Register a builtin PCI driver for the QEMU test device used to
+	  exercise PCI register capture in custom_crashdump. This
+	  device does not exist on real hardware.  Disable for production
+	  kernels to avoid the unnecessary probe.
+
+	  If unsure, say N.
+
 config ARCH_SUPPORTS_CRASH_HOTPLUG
 	def_bool y
 

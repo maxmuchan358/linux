@@ -64,7 +64,8 @@ static inline unsigned int crash_get_elfcorehdr_size(void) { return 0; }
 extern int crash_exclude_mem_range(struct crash_mem *mem,
 				   unsigned long long mstart,
 				   unsigned long long mend);
-extern int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
+extern int crash_prepare_elf64_headers(struct crash_mem *mem,
+				       int need_kernel_map,
 				       void **addr, unsigned long *sz);
 
 struct kimage;
