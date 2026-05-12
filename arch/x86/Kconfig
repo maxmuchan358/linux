@@ -2034,6 +2034,26 @@ config CUSTOM_CRASHDUMP_NMI_TEST_DEV
 
 	  If unsure, say N.
 
+config CUSTOM_CRASHDUMP_NMI_NET_DEV
+	bool "Custom crash dump: QEMU NIC diagnostic device (vendor=0x1d5f/device=0xd001)"
+	depends on CUSTOM_CRASHDUMP_NMI && PCI
+	help
+	  Register a descriptor for the QEMU custom NIC diagnostic device to
+	  capture NIC-style MMIO/PIO register state at crash time. The device
+	  (custom-crashdump-net) does not exist on real hardware.
+
+	  If unsure, say N.
+
+config CUSTOM_CRASHDUMP_NMI_STOR_DEV
+	bool "Custom crash dump: QEMU storage diagnostic device (vendor=0x1d5f/device=0xd002)"
+	depends on CUSTOM_CRASHDUMP_NMI && PCI
+	help
+	  Register a descriptor for the QEMU custom storage controller diagnostic
+	  device to capture NVMe-style MMIO register state at crash time. The
+	  device (custom-crashdump-stor) does not exist on real hardware.
+
+	  If unsure, say N.
+
 config ARCH_SUPPORTS_CRASH_HOTPLUG
 	def_bool y
 

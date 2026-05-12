@@ -56,8 +56,7 @@ static void kdump_nmi_callback(int cpu, struct pt_regs *regs)
 {
 	crash_save_cpu(regs, cpu);
 #ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
-	custom_crashdump_save_cpu(regs, cpu,
-				     in_nmi() ? CUSTOM_CONTEXT_SOURCE_NMI : CUSTOM_CONTEXT_SOURCE_IPI);
+	custom_crashdump_save_cpu(regs, cpu, CUSTOM_CONTEXT_SOURCE_NMI);
 #endif
 
 	/*

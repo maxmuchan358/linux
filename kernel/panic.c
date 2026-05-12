@@ -38,6 +38,7 @@
 #include <linux/seq_buf.h>
 #include <linux/sys_info.h>
 #include <trace/events/error_report.h>
+#include <asm/crash.h>
 #include <asm/sections.h>
 
 #define PANIC_TIMER_STEP 100
@@ -471,6 +472,16 @@ void vpanic(const char *fmt, va_list args)
 		/* go ahead */
 	} else if (panic_on_other_cpu())
 		panic_smp_self_stop();
+
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI
+	{
+		struct pt_regs panic_regs;
+
+		crash_setup_regs(&panic_regs, NULL);
+		custom_crashdump_save_cpu(&panic_regs, raw_smp_processor_id(),
+					  CUSTOM_CONTEXT_SOURCE_PANIC);
+	}
+#endif
 
 	console_verbose();
 	bust_spinlocks(1);

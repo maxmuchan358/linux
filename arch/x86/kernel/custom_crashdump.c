@@ -37,6 +37,7 @@
 #include <asm/fpu/types.h>
 #include <asm/fpu/xcr.h>
 #include <asm/io.h>
+#include <asm/pci_x86.h>
 #include <asm/msr.h>
 #include <asm/msr-index.h>
 #include <asm/processor.h>
@@ -47,19 +48,10 @@
 
 #define CUSTOM_TEST_VENDOR_ID        0x1d5f
 #define CUSTOM_TEST_DEVICE_ID        0xcafe
-#define CUSTOM_NMI_CFG_DWORD         0x40
 #define CUSTOM_VMCOREDD_MAGIC        0x4344564d
 #define CUSTOM_VMCOREDD_VERSION      7
 #define CUSTOM_CRASH_NOTE_NAME       "X86CUSTOM"
 #define CUSTOM_CRASH_NOTE_TYPE       0x58434e4d
-#define CUSTOM_CFG_DWORD_COUNT       48
-#define CUSTOM_MMIO_REG_COUNT        64
-#define CUSTOM_PIO_REG_COUNT         16
-#define CUSTOM_MMIO_INDEX_COUNT      32
-#define CUSTOM_PIO_INDEX_COUNT       16
-#define CUSTOM_MMIO_TABLE_COUNT      32
-#define CUSTOM_QUEUE_REG_COUNT       8
-#define CUSTOM_CPUID_LEAF_COUNT      4
 #define CUSTOM_MAX_TEST_DEVICES      8
 #define CUSTOM_MAX_CAPTURE_CPUS      NR_CPUS
 #define CUSTOM_MAX_CONTEXTS_PER_CPU  5
@@ -67,14 +59,16 @@
 #define CUSTOM_MAX_XSAVE_AREA_SIZE   16384
 #define CUSTOM_MSR_ENTRY_COUNT       24
 #define CUSTOM_APIC_VECTOR_REGS      8
+#define CUSTOM_CPUID_LEAF_COUNT      4
 
-#define CUSTOM_MMIO_INDEX_SEL        0x100
-#define CUSTOM_MMIO_INDEX_DATA       0x104
-#define CUSTOM_MMIO_TABLE_BASE       0x200
-#define CUSTOM_MMIO_QUEUE_BASE       0x300
+/* Device region types for custom_region_desc.type */
+#define CUSTOM_REGION_CFG            0  /* PCI config space (pci_read_config_dword) */
+#define CUSTOM_REGION_MMIO           1  /* MMIO via cached BAR iomap */
+#define CUSTOM_REGION_PIO            2  /* I/O port via BAR base + offset */
+#define CUSTOM_REGION_FIXED_PIO      3  /* Fixed absolute I/O port (offset = port addr) */
+#define CUSTOM_REGION_ECAM           4  /* ECAM via kernel MMCFG mapping (offset within 4KB) */
 
-#define CUSTOM_PIO_INDEX_SEL         0x40
-#define CUSTOM_PIO_INDEX_DATA        0x44
+#define CUSTOM_BAR_NONE              0xff  /* bar_mmio/bar_pio sentinel: no BAR */
 
 #define CUSTOM_SECTION_DEVICE_STATE  1
 #define CUSTOM_SECTION_CPU_STATE     2
@@ -90,8 +84,8 @@
 #define CUSTOM_CONTEXT_INDEX_TASK    0
 #define CUSTOM_CONTEXT_INDEX_IRQ     1
 #define CUSTOM_CONTEXT_INDEX_NMI     2
-#define CUSTOM_CONTEXT_INDEX_IPI     3
-#define CUSTOM_CONTEXT_INDEX_EXC     4
+#define CUSTOM_CONTEXT_INDEX_EXC     3
+#define CUSTOM_CONTEXT_INDEX_PANIC   4
 
 struct custom_vmcoredd_header {
 	u32 magic;
@@ -118,30 +112,58 @@ struct custom_vmcoredd_cpuid_leaf {
 	u32 edx;
 };
 
-struct custom_vmcoredd_device_state {
+/*
+ * Compile-time region descriptor: one entry per memory/IO region to capture.
+ * offset and size must be multiples of 4 (dword-aligned).
+ */
+struct custom_region_desc {
+	u32 type;    /* CUSTOM_REGION_CFG / MMIO / PIO */
+	u32 offset;  /* byte offset from BAR or config-space base */
+	u32 size;    /* byte count to read */
+};
+
+/*
+ * Compile-time device descriptor: identifies a PCI device and lists the
+ * regions to capture.  Defined statically; never modified at runtime.
+ */
+struct custom_device_desc {
+	u16 vendor_id;
+	u16 device_id;
+	u8  bar_mmio;   /* BAR index for MMIO, CUSTOM_BAR_NONE if absent */
+	u8  bar_pio;    /* BAR index for PIO,  CUSTOM_BAR_NONE if absent */
+	u8  reserved[2];
+	const struct custom_region_desc *regions;
+	u32 region_count;
+};
+
+/*
+ * Per-instance runtime state populated at probe time.
+ * Virtual addresses are cached here so that no ioremap is needed at panic.
+ */
+struct custom_device_runtime {
+	const struct custom_device_desc *desc;
+	struct pci_dev    *pdev;
+	void __iomem      *mmio_base;  /* cached virtual base for MMIO regions */
+	resource_size_t    pio_base;   /* cached I/O port base (BAR-based PIO) */
+	void __iomem      *ecam_base;  /* cached 4KB ECAM config page (kernel MMCFG mapping) */
+};
+
+/* Dump format: device identification header inside a DEVICE_STATE section */
+struct custom_vmcoredd_device_header {
 	u32 vendor_id;
 	u32 device_id;
 	u32 domain;
 	u32 bus_devfn;
-	u32 profile;
-	u32 instance_id;
-	u32 cfg_dword_count;
-	u32 mmio_reg_count;
-	u32 pio_reg_count;
-	u32 mmio_index_count;
-	u32 pio_index_count;
-	u32 mmio_table_count;
-	u32 queue_reg_count;
-	u32 mmio_index;
-	u32 pio_index;
 	u32 class_revision;
-	u32 pci_cfg_space[CUSTOM_CFG_DWORD_COUNT];
-	u32 mmio_regs[CUSTOM_MMIO_REG_COUNT];
-	u32 pio_regs[CUSTOM_PIO_REG_COUNT];
-	u32 mmio_indexed[CUSTOM_MMIO_INDEX_COUNT];
-	u32 pio_indexed[CUSTOM_PIO_INDEX_COUNT];
-	u32 mmio_table[CUSTOM_MMIO_TABLE_COUNT];
-	u32 queue_regs[CUSTOM_QUEUE_REG_COUNT];
+	u32 region_count;
+};
+
+/* Dump format: per-region header, immediately followed by 'size' bytes of data */
+struct custom_vmcoredd_region_header {
+	u32 type;
+	u32 offset;
+	u32 size;
+	u32 reserved;
 };
 
 struct custom_vmcoredd_cpu_state {
@@ -273,11 +295,6 @@ struct custom_vmcoredd_apic_state {
 	u32 irr[CUSTOM_APIC_VECTOR_REGS];
 };
 
-struct custom_bound_test_device {
-	struct pci_dev *pdev;
-	void __iomem *mmio;
-	resource_size_t pio;
-};
 
 static const u32 custom_tracked_msrs[CUSTOM_MSR_ENTRY_COUNT] = {
 	MSR_EFER,
@@ -306,10 +323,8 @@ static const u32 custom_tracked_msrs[CUSTOM_MSR_ENTRY_COUNT] = {
 	MSR_IA32_FLUSH_CMD,
 };
 
-static struct custom_bound_test_device custom_test_devices[CUSTOM_MAX_TEST_DEVICES];
-static struct custom_vmcoredd_device_state custom_last_device_states[CUSTOM_MAX_TEST_DEVICES];
-static unsigned int custom_bound_device_count;
-static unsigned int custom_last_device_count;
+static struct custom_device_runtime custom_runtime_devices[CUSTOM_MAX_TEST_DEVICES];
+static unsigned int custom_runtime_device_count;
 static struct custom_vmcoredd_system_state custom_last_system_state;
 static struct custom_vmcoredd_cpu_state custom_cpu_states[CUSTOM_MAX_CAPTURE_CPUS];
 static struct custom_vmcoredd_fpu_state custom_fpu_states[CUSTOM_MAX_CAPTURE_CPUS];
@@ -411,225 +426,189 @@ static void custom_capture_cpuid_leaf(struct custom_vmcoredd_cpuid_leaf *leaf,
 	cpuid_count(op, subleaf, &leaf->eax, &leaf->ebx, &leaf->ecx, &leaf->edx);
 }
 
-static int custom_find_bound_device_slot(struct pci_dev *pdev)
-{
-	unsigned int index;
-
-	for (index = 0; index < CUSTOM_MAX_TEST_DEVICES; index++) {
-		if (custom_test_devices[index].pdev == pdev)
-			return index;
-	}
-
-	return -1;
-}
-
-static int custom_alloc_bound_device_slot(void)
-{
-	unsigned int index;
-
-	for (index = 0; index < CUSTOM_MAX_TEST_DEVICES; index++) {
-		if (!custom_test_devices[index].pdev)
-			return index;
-	}
-
-	return -1;
-}
-
-static void custom_init_device_state_defaults(struct custom_vmcoredd_device_state *state)
-{
-	memset(state, 0, sizeof(*state));
-	state->vendor_id = CUSTOM_TEST_VENDOR_ID;
-	state->device_id = CUSTOM_TEST_DEVICE_ID;
-	state->cfg_dword_count = CUSTOM_CFG_DWORD_COUNT;
-	state->mmio_reg_count = CUSTOM_MMIO_REG_COUNT;
-	state->pio_reg_count = CUSTOM_PIO_REG_COUNT;
-	state->mmio_index_count = CUSTOM_MMIO_INDEX_COUNT;
-	state->pio_index_count = CUSTOM_PIO_INDEX_COUNT;
-	state->mmio_table_count = CUSTOM_MMIO_TABLE_COUNT;
-	state->queue_reg_count = CUSTOM_QUEUE_REG_COUNT;
-	state->mmio_index = 0xffffffff;
-	state->pio_index = 0xffffffff;
-	memset(state->pci_cfg_space, 0xff, sizeof(state->pci_cfg_space));
-	memset(state->mmio_regs, 0xff, sizeof(state->mmio_regs));
-	memset(state->pio_regs, 0xff, sizeof(state->pio_regs));
-	memset(state->mmio_indexed, 0xff, sizeof(state->mmio_indexed));
-	memset(state->pio_indexed, 0xff, sizeof(state->pio_indexed));
-	memset(state->mmio_table, 0xff, sizeof(state->mmio_table));
-	memset(state->queue_regs, 0xff, sizeof(state->queue_regs));
-}
-
-static void custom_cache_pci_cfg_space(struct pci_dev *pdev,
-				      struct custom_vmcoredd_device_state *state)
-{
-	unsigned int index;
-
-	for (index = 0; index < CUSTOM_CFG_DWORD_COUNT; index++)
-		pci_read_config_dword(pdev, CUSTOM_NMI_CFG_DWORD + (index * sizeof(u32)),
-				      &state->pci_cfg_space[index]);
-}
-
-static void custom_cache_mmio_state(void __iomem *mmio,
-				   struct custom_vmcoredd_device_state *state)
-{
-	unsigned int index;
-	u32 selector;
-
-	if (!mmio)
-		return;
-
-	for (index = 0; index < CUSTOM_MMIO_REG_COUNT; index++)
-		state->mmio_regs[index] = ioread32(mmio + (index * sizeof(u32)));
-
-	selector = ioread32(mmio + CUSTOM_MMIO_INDEX_SEL);
-	state->mmio_index = selector;
-
-	for (index = 0; index < CUSTOM_MMIO_INDEX_COUNT; index++) {
-		iowrite32(index, mmio + CUSTOM_MMIO_INDEX_SEL);
-		state->mmio_indexed[index] = ioread32(mmio + CUSTOM_MMIO_INDEX_DATA);
-	}
-	iowrite32(selector, mmio + CUSTOM_MMIO_INDEX_SEL);
-
-	for (index = 0; index < CUSTOM_MMIO_TABLE_COUNT; index++) {
-		state->mmio_table[index] =
-			ioread32(mmio + CUSTOM_MMIO_TABLE_BASE + (index * sizeof(u32)));
-	}
-
-	for (index = 0; index < CUSTOM_QUEUE_REG_COUNT; index++) {
-		state->queue_regs[index] =
-			ioread32(mmio + CUSTOM_MMIO_QUEUE_BASE + (index * sizeof(u32)));
-	}
-}
-
-static void custom_cache_pio_state(resource_size_t pio,
-				  struct custom_vmcoredd_device_state *state)
-{
-	unsigned int index;
-	u32 selector;
-
-	if (!pio)
-		return;
-
-	for (index = 0; index < CUSTOM_PIO_REG_COUNT; index++)
-		state->pio_regs[index] = inl(pio + (index * sizeof(u32)));
-
-	selector = inl(pio + CUSTOM_PIO_INDEX_SEL);
-	state->pio_index = selector;
-
-	for (index = 0; index < CUSTOM_PIO_INDEX_COUNT; index++) {
-		outl(index, pio + CUSTOM_PIO_INDEX_SEL);
-		state->pio_indexed[index] = inl(pio + CUSTOM_PIO_INDEX_DATA);
-	}
-	outl(selector, pio + CUSTOM_PIO_INDEX_SEL);
-}
-
 #ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV
-static int custom_crashdump_test_probe(struct pci_dev *pdev,
-				      const struct pci_device_id *id)
-{
-	void __iomem *mmio;
-	resource_size_t pio = 0;
-	int slot;
-	u16 vendor = 0;
-	u16 device = 0;
-
-	slot = custom_alloc_bound_device_slot();
-	if (slot < 0)
-		return -ENOSPC;
-
-	if (pcim_enable_device(pdev))
-		return -ENODEV;
-
-	if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM))
-		return -ENODEV;
-
-	mmio = pcim_iomap(pdev, 0, 0);
-	if (!mmio)
-		return -ENODEV;
-
-	if (pci_resource_flags(pdev, 1) & IORESOURCE_IO)
-		pio = pci_resource_start(pdev, 1);
-
-	custom_test_devices[slot].pdev = pdev;
-	custom_test_devices[slot].mmio = mmio;
-	custom_test_devices[slot].pio = pio;
-
-	pci_read_config_word(pdev, PCI_VENDOR_ID, &vendor);
-	pci_read_config_word(pdev, PCI_DEVICE_ID, &device);
-
-	pr_info("custom crashdump pci test device[%d] bound %04x:%04x mmio=%pa pio=%pa\n",
-		slot, vendor, device, &pdev->resource[0].start, &pio);
-
-	return 0;
-}
-
-static void custom_crashdump_test_remove(struct pci_dev *pdev)
-{
-	int slot;
-
-	slot = custom_find_bound_device_slot(pdev);
-	if (slot < 0)
-		return;
-
-	memset(&custom_test_devices[slot], 0, sizeof(custom_test_devices[slot]));
-}
-
-static const struct pci_device_id custom_crashdump_test_ids[] = {
-	{ PCI_DEVICE(CUSTOM_TEST_VENDOR_ID, CUSTOM_TEST_DEVICE_ID) },
-	{ 0, }
+/*
+ * Static region capture table for the test device (vendor=0x1d5f, device=0xcafe).
+ * offset and size must be multiples of 4.
+ */
+static const struct custom_region_desc custom_test_regions[] = {
+	{ CUSTOM_REGION_CFG,       0x00, 48 * sizeof(u32) },  /* first 48 dwords of config space */
+	{ CUSTOM_REGION_MMIO,      0x00, 64 * sizeof(u32) },  /* first 64 dwords of MMIO BAR0 */
+	{ CUSTOM_REGION_PIO,       0x00, 16 * sizeof(u32) },  /* first 16 dwords of PIO BAR1 */
+	{ CUSTOM_REGION_FIXED_PIO, 0x80,  1 * sizeof(u32) },  /* port 0x80: POST code register */
+	{ CUSTOM_REGION_FIXED_PIO, 0x61,  1 * sizeof(u32) },  /* port 0x61: System Control Port B */
+	{ CUSTOM_REGION_FIXED_PIO, 0x64,  1 * sizeof(u32) },  /* port 0x64: KBC status */
+	{ CUSTOM_REGION_FIXED_PIO, 0x70,  1 * sizeof(u32) },  /* port 0x70: RTC index */
+	{ CUSTOM_REGION_FIXED_PIO, 0x92,  1 * sizeof(u32) },  /* port 0x92: Port A (fast A20) */
+	{ CUSTOM_REGION_ECAM,      0x00, 16 * sizeof(u32) },  /* first 64 bytes via ECAM */
 };
 
-static struct pci_driver custom_crashdump_test_driver = {
-	.name = "custom_crashdump_test",
-	.id_table = custom_crashdump_test_ids,
-	.probe = custom_crashdump_test_probe,
-	.remove = custom_crashdump_test_remove,
+static const struct custom_device_desc custom_test_device_desc = {
+	.vendor_id    = CUSTOM_TEST_VENDOR_ID,
+	.device_id    = CUSTOM_TEST_DEVICE_ID,
+	.bar_mmio     = 0,
+	.bar_pio      = 1,
+	.regions      = custom_test_regions,
+	.region_count = ARRAY_SIZE(custom_test_regions),
 };
-
-builtin_pci_driver(custom_crashdump_test_driver);
 #endif /* CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV */
 
-static void custom_collect_device_state(const struct custom_bound_test_device *bound,
-				       struct custom_vmcoredd_device_state *state)
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_NET_DEV
+/*
+ * NIC diagnostic device (vendor=0x1d5f, device=0xd001)
+ *
+ * BAR0 MMIO layout:
+ *   0x000-0x06c  28 direct regs: MAC, link, Rx/Tx stats, error counters, ctrl, PHY
+ *   0x100-0x104   2 regs: indirect index select + indirect data window
+ * BAR1 PIO:
+ *   0x00-0x3c   16 dwords: cmd, status, DMA address, descriptor pointers, misc
+ */
+#define CUSTOM_NET_VENDOR_ID    0x1d5f
+#define CUSTOM_NET_DEVICE_ID    0xd001
+
+static const struct custom_region_desc custom_net_regions[] = {
+	{ CUSTOM_REGION_CFG,  0x00,  16 * sizeof(u32) },  /* config space header (64 bytes) */
+	{ CUSTOM_REGION_MMIO, 0x00,  28 * sizeof(u32) },  /* 0x000-0x06c: direct registers */
+	{ CUSTOM_REGION_MMIO, 0x100,  2 * sizeof(u32) },  /* 0x100-0x104: indirect index/data */
+	{ CUSTOM_REGION_PIO,  0x00,  16 * sizeof(u32) },  /* 0x00-0x3c: all PIO registers */
+};
+
+static const struct custom_device_desc custom_net_device_desc = {
+	.vendor_id    = CUSTOM_NET_VENDOR_ID,
+	.device_id    = CUSTOM_NET_DEVICE_ID,
+	.bar_mmio     = 0,
+	.bar_pio      = 1,
+	.regions      = custom_net_regions,
+	.region_count = ARRAY_SIZE(custom_net_regions),
+};
+#endif /* CONFIG_CUSTOM_CRASHDUMP_NMI_NET_DEV */
+
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_STOR_DEV
+/*
+ * Storage controller diagnostic device (vendor=0x1d5f, device=0xd002)
+ *
+ * BAR0 MMIO layout (NVMe-style):
+ *   0x000-0x03c  16 dwords: CAP, VS, INTMS/INTMC, CC, CSTS, NSSR, AQA, ASQ, ACQ,
+ *                           CMBLOC, CMBSZ, BPINFO
+ *   0x040-0x07c  16 dwords: extended controller registers
+ *   0x200-0x27c  32 dwords: queue doorbells / firmware scratchpad
+ */
+#define CUSTOM_STOR_VENDOR_ID   0x1d5f
+#define CUSTOM_STOR_DEVICE_ID   0xd002
+
+static const struct custom_region_desc custom_stor_regions[] = {
+	{ CUSTOM_REGION_CFG,  0x00,  16 * sizeof(u32) },  /* config space header (64 bytes) */
+	{ CUSTOM_REGION_MMIO, 0x00,  16 * sizeof(u32) },  /* 0x000-0x03c: NVMe-style main regs */
+	{ CUSTOM_REGION_MMIO, 0x040, 16 * sizeof(u32) },  /* 0x040-0x07c: extended regs */
+	{ CUSTOM_REGION_MMIO, 0x200, 32 * sizeof(u32) },  /* 0x200-0x27c: doorbells/scratchpad */
+};
+
+static const struct custom_device_desc custom_stor_device_desc = {
+	.vendor_id    = CUSTOM_STOR_VENDOR_ID,
+	.device_id    = CUSTOM_STOR_DEVICE_ID,
+	.bar_mmio     = 0,
+	.bar_pio      = CUSTOM_BAR_NONE,
+	.regions      = custom_stor_regions,
+	.region_count = ARRAY_SIZE(custom_stor_regions),
+};
+#endif /* CONFIG_CUSTOM_CRASHDUMP_NMI_STOR_DEV */
+
+/*
+ * Table of all device descriptors to cache at initcall time.
+ * Add a pointer here for each device type that should be captured at panic.
+ */
+static const struct custom_device_desc * const custom_device_descs[] = {
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_TEST_DEV
+	&custom_test_device_desc,
+#endif
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_NET_DEV
+	&custom_net_device_desc,
+#endif
+#ifdef CONFIG_CUSTOM_CRASHDUMP_NMI_STOR_DEV
+	&custom_stor_device_desc,
+#endif
+};
+
+/*
+ * Scan custom_device_descs[], find matching PCI devices, and cache their
+ * virtual addresses.  Runs once at device_initcall; no ioremap at panic.
+ */
+static int __init custom_crashdump_cache_devices(void)
 {
-	custom_init_device_state_defaults(state);
-	if (!bound->pdev)
-		return;
+	unsigned int d;
 
-	state->vendor_id = bound->pdev->vendor;
-	state->device_id = bound->pdev->device;
-	state->domain = pci_domain_nr(bound->pdev->bus);
-	state->bus_devfn = ((u32)bound->pdev->bus->number << 8) | bound->pdev->devfn;
-	state->class_revision = bound->pdev->class;
-	pci_read_config_dword(bound->pdev, 0x44, &state->profile);
-	pci_read_config_dword(bound->pdev, 0x48, &state->instance_id);
+	for (d = 0; d < ARRAY_SIZE(custom_device_descs); d++) {
+		const struct custom_device_desc *desc = custom_device_descs[d];
+		struct pci_dev *pdev = NULL;
 
-	custom_cache_pci_cfg_space(bound->pdev, state);
-	custom_cache_mmio_state(bound->mmio, state);
-	custom_cache_pio_state(bound->pio, state);
-}
+		while ((pdev = pci_get_device(desc->vendor_id, desc->device_id,
+					      pdev)) != NULL) {
+			void __iomem *mmio = NULL;
+			void __iomem *ecam = NULL;
+			resource_size_t pio = 0;
+			unsigned int slot, r;
+			bool needs_ecam = false;
 
-static void custom_collect_device_states(void)
-{
-	unsigned int index;
+			if (custom_runtime_device_count >= CUSTOM_MAX_TEST_DEVICES) {
+				pr_warn("custom crashdump: device table full, skipping %04x:%04x\n",
+					desc->vendor_id, desc->device_id);
+				pci_dev_put(pdev);
+				pdev = NULL;
+				break;
+			}
+			slot = custom_runtime_device_count;
 
-	custom_bound_device_count = 0;
-	custom_last_device_count = 0;
-	for (index = 0; index < CUSTOM_MAX_TEST_DEVICES; index++) {
-		if (!custom_test_devices[index].pdev)
-			continue;
-		custom_bound_device_count++;
-		custom_collect_device_state(&custom_test_devices[index],
-					   &custom_last_device_states[custom_last_device_count]);
-		custom_last_device_count++;
+			if (pci_enable_device(pdev)) {
+				pr_warn("custom crashdump: failed to enable %04x:%04x\n",
+					desc->vendor_id, desc->device_id);
+				continue;
+			}
+
+			if (desc->bar_mmio != CUSTOM_BAR_NONE &&
+			    (pci_resource_flags(pdev, desc->bar_mmio) & IORESOURCE_MEM)) {
+				mmio = pci_iomap(pdev, desc->bar_mmio, 0);
+				if (!mmio)
+					pr_warn("custom crashdump: iomap failed for %04x:%04x BAR%u\n",
+						desc->vendor_id, desc->device_id, desc->bar_mmio);
+			}
+
+			if (desc->bar_pio != CUSTOM_BAR_NONE &&
+			    (pci_resource_flags(pdev, desc->bar_pio) & IORESOURCE_IO))
+				pio = pci_resource_start(pdev, desc->bar_pio);
+
+			for (r = 0; r < desc->region_count; r++) {
+				if (desc->regions[r].type == CUSTOM_REGION_ECAM) {
+					needs_ecam = true;
+					break;
+				}
+			}
+			if (needs_ecam) {
+				struct pci_mmcfg_region *cfg =
+					pci_mmconfig_lookup(pci_domain_nr(pdev->bus),
+							    pdev->bus->number);
+				if (cfg && cfg->virt)
+					ecam = (void __iomem *)(cfg->virt +
+						PCI_MMCFG_BUS_OFFSET(pdev->bus->number) +
+						((u32)pdev->devfn << 12));
+				if (!ecam)
+					pr_warn("custom crashdump: ECAM not available for %04x:%04x\n",
+						desc->vendor_id, desc->device_id);
+			}
+
+			custom_runtime_devices[slot].desc      = desc;
+			custom_runtime_devices[slot].pdev      = pci_dev_get(pdev);
+			custom_runtime_devices[slot].mmio_base = mmio;
+			custom_runtime_devices[slot].pio_base  = pio;
+			custom_runtime_devices[slot].ecam_base = ecam;
+			custom_runtime_device_count++;
+
+			pr_info("custom crashdump: cached device[%u] %04x:%04x mmio=%px pio=%pa ecam=%px\n",
+				slot, pdev->vendor, pdev->device, mmio, &pio, ecam);
+		}
 	}
-
-	if (!custom_last_device_count) {
-		struct custom_bound_test_device empty = { 0 };
-
-		custom_collect_device_state(&empty, &custom_last_device_states[0]);
-		custom_last_device_count = 1;
-	}
+	return 0;
 }
+device_initcall(custom_crashdump_cache_devices);
 
 static unsigned int custom_first_valid_cpu(void)
 {
@@ -877,10 +856,10 @@ static unsigned int custom_context_index(u32 source)
 		return CUSTOM_CONTEXT_INDEX_IRQ;
 	case CUSTOM_CONTEXT_SOURCE_NMI:
 		return CUSTOM_CONTEXT_INDEX_NMI;
-	case CUSTOM_CONTEXT_SOURCE_IPI:
-		return CUSTOM_CONTEXT_INDEX_IPI;
 	case CUSTOM_CONTEXT_SOURCE_EXCEPTION:
 		return CUSTOM_CONTEXT_INDEX_EXC;
+	case CUSTOM_CONTEXT_SOURCE_PANIC:
+		return CUSTOM_CONTEXT_INDEX_PANIC;
 	default:
 		return CUSTOM_CONTEXT_INDEX_EXC;
 	}
@@ -925,8 +904,7 @@ void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source)
 	if (cpu < 0 || cpu >= CUSTOM_MAX_CAPTURE_CPUS)
 		return;
 
-	live_fpu = source != CUSTOM_CONTEXT_SOURCE_NMI &&
-		   source != CUSTOM_CONTEXT_SOURCE_IPI;
+	live_fpu = source != CUSTOM_CONTEXT_SOURCE_NMI;
 	custom_collect_cpu_bundle(cpu, live_fpu);
 	contexts = custom_cpu_contexts[cpu];
 
@@ -943,9 +921,6 @@ void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source)
 				     source == CUSTOM_CONTEXT_SOURCE_EXCEPTION ?
 				     current->thread.trap_nr : 0,
 				     0);
-	if (source == CUSTOM_CONTEXT_SOURCE_NMI)
-		custom_fill_context_from_regs(&contexts[CUSTOM_CONTEXT_INDEX_IPI], regs,
-					     CUSTOM_CONTEXT_SOURCE_IPI, 0, 0);
 	if (!regs && index == CUSTOM_CONTEXT_INDEX_EXC)
 		contexts[index].cpu_id = cpu;
 	if (cpu != raw_smp_processor_id()) {
@@ -978,6 +953,122 @@ static u8 *custom_note_append_section(u8 *cursor, const u8 *limit, u32 type,
 	return cursor + aligned_size;
 }
 
+/*
+ * Compute the byte size of the data payload for one DEVICE_STATE section.
+ * All region sizes must be multiples of 4, so no padding is needed.
+ */
+static u32 custom_device_section_size(const struct custom_device_desc *desc)
+{
+	u32 size = sizeof(struct custom_vmcoredd_device_header);
+	u32 i;
+
+	for (i = 0; i < desc->region_count; i++)
+		size += sizeof(struct custom_vmcoredd_region_header) +
+			desc->regions[i].size;
+	return size;
+}
+
+/*
+ * Write one DEVICE_STATE section directly into the PT_NOTE buffer.
+ * Reads are performed using cached virtual addresses; no ioremap at panic.
+ */
+static u8 *custom_note_append_device(u8 *cursor, const u8 *limit,
+				     const struct custom_device_runtime *dev,
+				     u32 *section_count)
+{
+	const struct custom_device_desc *desc = dev->desc;
+	struct custom_vmcoredd_section *sec;
+	struct custom_vmcoredd_device_header *dh;
+	u32 data_size = custom_device_section_size(desc);
+	u32 i, j;
+
+	if (cursor + sizeof(*sec) + data_size > limit)
+		return NULL;
+
+	sec = (struct custom_vmcoredd_section *)cursor;
+	sec->type = CUSTOM_SECTION_DEVICE_STATE;
+	sec->size = data_size;
+	cursor += sizeof(*sec);
+
+	dh = (struct custom_vmcoredd_device_header *)cursor;
+	dh->vendor_id      = dev->pdev ? dev->pdev->vendor : 0;
+	dh->device_id      = dev->pdev ? dev->pdev->device : 0;
+	dh->domain         = dev->pdev ? pci_domain_nr(dev->pdev->bus) : 0;
+	dh->bus_devfn      = dev->pdev ? ((u32)dev->pdev->bus->number << 8 |
+					   dev->pdev->devfn) : 0;
+	dh->class_revision = dev->pdev ? dev->pdev->class : 0;
+	dh->region_count   = desc->region_count;
+	cursor += sizeof(*dh);
+
+	for (i = 0; i < desc->region_count; i++) {
+		const struct custom_region_desc *rd = &desc->regions[i];
+		struct custom_vmcoredd_region_header *rh;
+		u32 *data;
+		u32 nwords = rd->size / sizeof(u32);
+
+		rh = (struct custom_vmcoredd_region_header *)cursor;
+		rh->type     = rd->type;
+		rh->offset   = rd->offset;
+		rh->size     = rd->size;
+		rh->reserved = 0;
+		cursor += sizeof(*rh);
+
+		data = (u32 *)cursor;
+		switch (rd->type) {
+		case CUSTOM_REGION_CFG:
+			if (dev->pdev) {
+				for (j = 0; j < nwords; j++)
+					pci_read_config_dword(dev->pdev,
+							      rd->offset + j * sizeof(u32),
+							      &data[j]);
+			} else {
+				memset(data, 0xff, rd->size);
+			}
+			break;
+		case CUSTOM_REGION_MMIO:
+			if (dev->mmio_base) {
+				for (j = 0; j < nwords; j++)
+					data[j] = ioread32(dev->mmio_base +
+							   rd->offset + j * sizeof(u32));
+			} else {
+				memset(data, 0xff, rd->size);
+			}
+			break;
+		case CUSTOM_REGION_PIO:
+			if (dev->pio_base) {
+				for (j = 0; j < nwords; j++)
+					data[j] = inl(dev->pio_base +
+						      rd->offset + j * sizeof(u32));
+			} else {
+				memset(data, 0xff, rd->size);
+			}
+			break;
+		case CUSTOM_REGION_FIXED_PIO:
+			/* rd->offset is the absolute I/O port base address */
+			for (j = 0; j < nwords; j++)
+				data[j] = inl(rd->offset + j * sizeof(u32));
+			break;
+		case CUSTOM_REGION_ECAM:
+			/* rd->offset is byte offset within the 4KB ECAM config page */
+			if (dev->ecam_base) {
+				for (j = 0; j < nwords; j++)
+					data[j] = ioread32(dev->ecam_base +
+							   rd->offset + j * sizeof(u32));
+			} else {
+				memset(data, 0xff, rd->size);
+			}
+			break;
+		default:
+			memset(data, 0xff, rd->size);
+			break;
+		}
+		cursor += rd->size;
+	}
+
+	(*section_count)++;
+	return cursor;
+}
+
 static u32 custom_context_section_size(const struct custom_vmcoredd_context_state *state)
 {
 	return offsetof(struct custom_vmcoredd_context_state, stack_snapshot) +
@@ -999,7 +1090,6 @@ void custom_crashdump_capture(void)
 	if (!custom_vmcore_note)
 		return;
 
-	custom_collect_device_states();
 	custom_collect_system_state(&custom_last_system_state);
 	custom_vmcore_note_prepare();
 }
@@ -1018,15 +1108,9 @@ static void custom_vmcoreinfo_extra_append(void)
 	vmcoreinfo_append_str("CUSTOM_NOTE_TYPE=0x%x\n", CUSTOM_CRASH_NOTE_TYPE);
 	vmcoreinfo_append_str("CUSTOM_NOTE_SIZE=%zu\n", custom_vmcore_note_size);
 	vmcoreinfo_append_str("CUSTOM_SECTION_COUNT=%u\n", hdr->section_count);
-	vmcoreinfo_append_str("CUSTOM_DEVICE_COUNT=%u\n", custom_bound_device_count);
+	vmcoreinfo_append_str("CUSTOM_DEVICE_COUNT=%u\n", custom_runtime_device_count);
 	vmcoreinfo_append_str("CUSTOM_CPU_COUNT=%u\n", custom_count_valid_cpu_slots());
 	vmcoreinfo_append_str("CUSTOM_CONTEXT_COUNT=%u\n", custom_count_context_valid());
-	vmcoreinfo_append_str("CUSTOM_PCI_CFG40=0x%08x\n",
-				 custom_last_device_states[0].pci_cfg_space[0]);
-	vmcoreinfo_append_str("CUSTOM_MMIO32=0x%08x\n",
-				 custom_last_device_states[0].mmio_regs[0]);
-	vmcoreinfo_append_str("CUSTOM_IOPORT32=0x%08x\n",
-				 custom_last_device_states[0].pio_regs[0]);
 	cpu = custom_first_valid_cpu();
 	if (cpu < CUSTOM_MAX_CAPTURE_CPUS) {
 		vmcoreinfo_append_str("CUSTOM_CPU_ID=%u\n", custom_cpu_states[cpu].cpu_id);
@@ -1067,16 +1151,6 @@ static void custom_vmcore_note_prepare(void)
 	hdr->flags = 0;
 	hdr->reserved0 = 0;
 	hdr->reserved1 = 0;
-
-	for (device_index = 0; device_index < custom_last_device_count; device_index++) {
-		cursor = custom_note_append_section(cursor, limit,
-					   CUSTOM_SECTION_DEVICE_STATE,
-					   &custom_last_device_states[device_index],
-					   sizeof(custom_last_device_states[device_index]),
-					   &hdr->section_count);
-		if (!cursor)
-			goto overflow;
-	}
 
 	cursor = custom_note_append_section(cursor, limit, CUSTOM_SECTION_SYSTEM_STATE,
 					   &custom_last_system_state,
@@ -1136,6 +1210,14 @@ static void custom_vmcore_note_prepare(void)
 		}
 	}
 
+	for (device_index = 0; device_index < custom_runtime_device_count; device_index++) {
+		cursor = custom_note_append_device(cursor, limit,
+						   &custom_runtime_devices[device_index],
+						   &hdr->section_count);
+		if (!cursor)
+			goto overflow;
+	}
+
 	hdr->total_size = cursor - (u8 *)hdr;
 	hdr->payload_crc = 0;
 	hdr->payload_crc = crc32_le(0, (u8 *)(hdr + 1), hdr->total_size - sizeof(*hdr));
@@ -1151,7 +1233,7 @@ static void custom_vmcore_note_prepare(void)
 		(u8 *)note_buf;
 
 	pr_info("custom crashdump: vmcore note prepared size=%zu devices=%u sections=%u\n",
-		custom_vmcore_note_size, custom_last_device_count, hdr->section_count);
+		custom_vmcore_note_size, custom_runtime_device_count, hdr->section_count);
 	return;
 
 overflow:

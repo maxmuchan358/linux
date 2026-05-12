@@ -15,8 +15,8 @@ enum custom_crashdump_context_source {
     CUSTOM_CONTEXT_SOURCE_TASK = 1,
     CUSTOM_CONTEXT_SOURCE_IRQ = 2,
     CUSTOM_CONTEXT_SOURCE_NMI = 3,
-    CUSTOM_CONTEXT_SOURCE_IPI = 4,
-    CUSTOM_CONTEXT_SOURCE_EXCEPTION = 5,
+    CUSTOM_CONTEXT_SOURCE_EXCEPTION = 4,
+    CUSTOM_CONTEXT_SOURCE_PANIC = 5,
 };
 
 void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source);
