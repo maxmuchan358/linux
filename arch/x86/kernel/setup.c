@@ -34,6 +34,7 @@
 #include <asm/apic.h>
 #include <asm/bios_ebda.h>
 #include <asm/bugs.h>
+#include <asm/crash.h>
 #include <asm/cacheinfo.h>
 #include <asm/coco.h>
 #include <asm/cpu.h>

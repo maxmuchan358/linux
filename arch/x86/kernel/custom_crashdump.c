@@ -53,13 +53,14 @@
 #define CUSTOM_CRASH_NOTE_NAME       "X86CUSTOM"
 #define CUSTOM_CRASH_NOTE_TYPE       0x58434e4d
 #define CUSTOM_MAX_TEST_DEVICES      8
-#define CUSTOM_MAX_CAPTURE_CPUS      NR_CPUS
-#define CUSTOM_MAX_CONTEXTS_PER_CPU  5
+#define CUSTOM_MAX_CAPTURE_CPUS      4
+#define CUSTOM_MAX_CONTEXTS_PER_CPU  4
 #define CUSTOM_CONTEXT_STACK_BYTES   512
 #define CUSTOM_MAX_XSAVE_AREA_SIZE   16384
 #define CUSTOM_MSR_ENTRY_COUNT       24
 #define CUSTOM_APIC_VECTOR_REGS      8
 #define CUSTOM_CPUID_LEAF_COUNT      4
+#define CUSTOM_MAX_DEVICE_SLOT_BYTES 1024
 
 /* Device region types for custom_region_desc.type */
 #define CUSTOM_REGION_CFG            0  /* PCI config space (pci_read_config_dword) */
@@ -80,12 +81,10 @@
 
 #define CUSTOM_CRASH_NOTE_NAME_BYTES ALIGN(sizeof(CUSTOM_CRASH_NOTE_NAME), 4)
 #define CUSTOM_CRASH_NOTE_BYTES      (1024 * 1024)
-
 #define CUSTOM_CONTEXT_INDEX_TASK    0
 #define CUSTOM_CONTEXT_INDEX_IRQ     1
 #define CUSTOM_CONTEXT_INDEX_NMI     2
 #define CUSTOM_CONTEXT_INDEX_EXC     3
-#define CUSTOM_CONTEXT_INDEX_PANIC   4
 
 struct custom_vmcoredd_header {
 	u32 magic;
@@ -295,6 +294,94 @@ struct custom_vmcoredd_apic_state {
 	u32 irr[CUSTOM_APIC_VECTOR_REGS];
 };
 
+/* Fixed prefix that precedes the variable-length custom section payload. */
+struct custom_vmcoredd_note_prefix {
+	struct elf_note note;
+	char name[CUSTOM_CRASH_NOTE_NAME_BYTES];
+	struct custom_vmcoredd_header header;
+};
+
+struct custom_vmcoredd_system_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_system_state state;
+};
+
+struct custom_vmcoredd_cpu_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_cpu_state state;
+};
+
+struct custom_vmcoredd_fpu_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_fpu_state state;
+};
+
+struct custom_vmcoredd_msr_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_msr_state state;
+};
+
+struct custom_vmcoredd_apic_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_apic_state state;
+};
+
+struct custom_vmcoredd_context_slot {
+	struct custom_vmcoredd_section sec;
+	struct custom_vmcoredd_context_state state;
+};
+
+struct custom_vmcoredd_device_slot {
+	struct custom_vmcoredd_section sec;
+	u8 data[CUSTOM_MAX_DEVICE_SLOT_BYTES];
+};
+
+#define CUSTOM_FIXED_SECTION_COUNT \
+	(1 + CUSTOM_MAX_CAPTURE_CPUS * (4 + CUSTOM_MAX_CONTEXTS_PER_CPU) + \
+	 CUSTOM_MAX_TEST_DEVICES)
+
+#define CUSTOM_CRASH_NOTE_FIXED_BYTES \
+	(sizeof(struct custom_vmcoredd_note_prefix) + \
+	 sizeof(struct custom_vmcoredd_system_slot) + \
+	 sizeof(struct custom_vmcoredd_cpu_slot) * CUSTOM_MAX_CAPTURE_CPUS + \
+	 sizeof(struct custom_vmcoredd_fpu_slot) * CUSTOM_MAX_CAPTURE_CPUS + \
+	 sizeof(struct custom_vmcoredd_msr_slot) * CUSTOM_MAX_CAPTURE_CPUS + \
+	 sizeof(struct custom_vmcoredd_apic_slot) * CUSTOM_MAX_CAPTURE_CPUS + \
+	 sizeof(struct custom_vmcoredd_context_slot) * \
+		CUSTOM_MAX_CAPTURE_CPUS * CUSTOM_MAX_CONTEXTS_PER_CPU + \
+	 sizeof(struct custom_vmcoredd_device_slot) * CUSTOM_MAX_TEST_DEVICES)
+
+/*
+ * Full in-memory PT_NOTE image kept in BSS so crash can inspect the layout
+ * directly with a typed global symbol.
+ */
+struct custom_vmcoredd_note_layout {
+	struct custom_vmcoredd_note_prefix prefix;
+	struct custom_vmcoredd_system_slot system;
+	struct custom_vmcoredd_cpu_slot cpu[CUSTOM_MAX_CAPTURE_CPUS];
+	struct custom_vmcoredd_fpu_slot fpu[CUSTOM_MAX_CAPTURE_CPUS];
+	struct custom_vmcoredd_msr_slot msr[CUSTOM_MAX_CAPTURE_CPUS];
+	struct custom_vmcoredd_apic_slot apic[CUSTOM_MAX_CAPTURE_CPUS];
+	struct custom_vmcoredd_context_slot ctx[CUSTOM_MAX_CAPTURE_CPUS][CUSTOM_MAX_CONTEXTS_PER_CPU];
+	struct custom_vmcoredd_device_slot device[CUSTOM_MAX_TEST_DEVICES];
+	struct elf_note tail;
+};
+
+union custom_vmcoredd_note_storage {
+	struct custom_vmcoredd_note_layout layout;
+	u8 bytes[CUSTOM_CRASH_NOTE_BYTES];
+};
+
+enum custom_vmcoredd_capture_state {
+	CUSTOM_CAPTURE_UNINITIALIZED,
+	CUSTOM_CAPTURE_INITIALIZING,
+	CUSTOM_CAPTURE_READY,
+	CUSTOM_CAPTURE_OVERFLOW,
+};
+
+static_assert(sizeof(struct custom_vmcoredd_note_layout) <= CUSTOM_CRASH_NOTE_BYTES);
+static_assert(sizeof(union custom_vmcoredd_note_storage) == CUSTOM_CRASH_NOTE_BYTES);
+
 
 static const u32 custom_tracked_msrs[CUSTOM_MSR_ENTRY_COUNT] = {
 	MSR_EFER,
@@ -325,74 +412,235 @@ static const u32 custom_tracked_msrs[CUSTOM_MSR_ENTRY_COUNT] = {
 
 static struct custom_device_runtime custom_runtime_devices[CUSTOM_MAX_TEST_DEVICES];
 static unsigned int custom_runtime_device_count;
-static struct custom_vmcoredd_system_state custom_last_system_state;
-static struct custom_vmcoredd_cpu_state custom_cpu_states[CUSTOM_MAX_CAPTURE_CPUS];
-static struct custom_vmcoredd_fpu_state custom_fpu_states[CUSTOM_MAX_CAPTURE_CPUS];
-static struct custom_vmcoredd_msr_state custom_msr_states[CUSTOM_MAX_CAPTURE_CPUS];
-static struct custom_vmcoredd_apic_state custom_apic_states[CUSTOM_MAX_CAPTURE_CPUS];
-static struct custom_vmcoredd_context_state
-	custom_cpu_contexts[CUSTOM_MAX_CAPTURE_CPUS][CUSTOM_MAX_CONTEXTS_PER_CPU];
-static void *custom_vmcore_note;
-static phys_addr_t custom_vmcore_note_phys;
+static union custom_vmcoredd_note_storage custom_vmcore_note_storage __aligned(PAGE_SIZE);
+static atomic_t custom_capture_state = ATOMIC_INIT(CUSTOM_CAPTURE_UNINITIALIZED);
 static size_t custom_vmcore_note_size;
 
-static int __init custom_reserve_vmcore_note_buffer(void);
+#define custom_vmcore_note custom_vmcore_note_storage.layout
+
 static void custom_vmcore_note_prepare(void);
 void custom_crashdump_capture(void);
 void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source);
 static void custom_vmcoreinfo_extra_append(void);
+static unsigned int custom_count_valid_cpu_slots(void);
+static unsigned int custom_count_context_valid(void);
+static unsigned int custom_capture_section_count(void);
 
-static struct custom_vmcoredd_header *custom_vmcore_note_desc(void *note_buf)
+static struct elf_note *custom_vmcore_note_header(void)
 {
-	return (struct custom_vmcoredd_header *)((u8 *)note_buf +
-		sizeof(struct elf_note) + CUSTOM_CRASH_NOTE_NAME_BYTES);
+	return &custom_vmcore_note.prefix.note;
 }
 
-static bool __init custom_range_overlaps_resource(phys_addr_t start,
-					 size_t size,
-					 const struct resource *res)
+static struct custom_vmcoredd_header *custom_vmcore_note_desc(void)
 {
-	phys_addr_t end;
+	return &custom_vmcore_note.prefix.header;
+}
 
-	if (res->end <= res->start)
+static struct custom_vmcoredd_system_state *custom_system_state_ptr(void)
+{
+	return &custom_vmcore_note.system.state;
+}
+
+static struct custom_vmcoredd_cpu_state *custom_cpu_state_ptr(unsigned int cpu)
+{
+	return &custom_vmcore_note.cpu[cpu].state;
+}
+
+static struct custom_vmcoredd_fpu_state *custom_fpu_state_ptr(unsigned int cpu)
+{
+	return &custom_vmcore_note.fpu[cpu].state;
+}
+
+static struct custom_vmcoredd_msr_state *custom_msr_state_ptr(unsigned int cpu)
+{
+	return &custom_vmcore_note.msr[cpu].state;
+}
+
+static struct custom_vmcoredd_apic_state *custom_apic_state_ptr(unsigned int cpu)
+{
+	return &custom_vmcore_note.apic[cpu].state;
+}
+
+static struct custom_vmcoredd_context_state *custom_context_state_ptr(unsigned int cpu,
+						      unsigned int index)
+{
+	return &custom_vmcore_note.ctx[cpu][index].state;
+}
+
+static struct custom_vmcoredd_device_header *custom_device_state_ptr(unsigned int index)
+{
+	return (struct custom_vmcoredd_device_header *)custom_vmcore_note.device[index].data;
+}
+
+static bool custom_vmcore_note_mark_overflow(void)
+{
+	atomic_set(&custom_capture_state, CUSTOM_CAPTURE_OVERFLOW);
+	custom_vmcore_note_size = 0;
+	return false;
+}
+
+static void custom_vmcore_note_reset_capture(void)
+{
+	struct custom_vmcoredd_header *hdr = custom_vmcore_note_desc();
+	unsigned int cpu;
+	unsigned int ctx;
+	unsigned int device;
+
+	memset(&custom_vmcore_note, 0, sizeof(custom_vmcore_note));
+
+	hdr->magic = CUSTOM_VMCOREDD_MAGIC;
+	hdr->version = CUSTOM_VMCOREDD_VERSION;
+	hdr->flags = 0;
+	hdr->reserved0 = 0;
+	hdr->reserved1 = 0;
+	custom_vmcore_note.system.sec.type = CUSTOM_SECTION_SYSTEM_STATE;
+	custom_vmcore_note.system.sec.size = sizeof(custom_vmcore_note.system.state);
+	for (cpu = 0; cpu < CUSTOM_MAX_CAPTURE_CPUS; cpu++) {
+		custom_vmcore_note.cpu[cpu].sec.type = CUSTOM_SECTION_CPU_STATE;
+		custom_vmcore_note.cpu[cpu].sec.size = sizeof(custom_vmcore_note.cpu[cpu].state);
+		custom_vmcore_note.fpu[cpu].sec.type = CUSTOM_SECTION_FPU_STATE;
+		custom_vmcore_note.fpu[cpu].sec.size = sizeof(custom_vmcore_note.fpu[cpu].state);
+		custom_vmcore_note.msr[cpu].sec.type = CUSTOM_SECTION_MSR_STATE;
+		custom_vmcore_note.msr[cpu].sec.size = sizeof(custom_vmcore_note.msr[cpu].state);
+		custom_vmcore_note.apic[cpu].sec.type = CUSTOM_SECTION_APIC_STATE;
+		custom_vmcore_note.apic[cpu].sec.size = sizeof(custom_vmcore_note.apic[cpu].state);
+		for (ctx = 0; ctx < CUSTOM_MAX_CONTEXTS_PER_CPU; ctx++) {
+			custom_vmcore_note.ctx[cpu][ctx].sec.type = CUSTOM_SECTION_CONTEXT_STATE;
+			custom_vmcore_note.ctx[cpu][ctx].sec.size = sizeof(custom_vmcore_note.ctx[cpu][ctx].state);
+		}
+	}
+	for (device = 0; device < CUSTOM_MAX_TEST_DEVICES; device++) {
+		custom_vmcore_note.device[device].sec.type = CUSTOM_SECTION_DEVICE_STATE;
+		custom_vmcore_note.device[device].sec.size = sizeof(custom_vmcore_note.device[device].data);
+	}
+	atomic_set(&custom_capture_state, CUSTOM_CAPTURE_READY);
+}
+
+static bool custom_vmcore_note_ensure_ready(void)
+{
+	int state;
+
+	for (;;) {
+		state = atomic_read(&custom_capture_state);
+		switch (state) {
+		case CUSTOM_CAPTURE_READY:
+			return true;
+		case CUSTOM_CAPTURE_OVERFLOW:
+			return false;
+		case CUSTOM_CAPTURE_UNINITIALIZED:
+			if (atomic_cmpxchg(&custom_capture_state,
+						  CUSTOM_CAPTURE_UNINITIALIZED,
+						  CUSTOM_CAPTURE_INITIALIZING) ==
+				    CUSTOM_CAPTURE_UNINITIALIZED) {
+				custom_vmcore_note_reset_capture();
+				return true;
+			}
+			break;
+		case CUSTOM_CAPTURE_INITIALIZING:
+			cpu_relax();
+			break;
+		default:
+			return false;
+		}
+	}
+}
+
+static bool custom_vmcore_note_store_system_state(
+	const struct custom_vmcoredd_system_state *state)
+{
+	struct custom_vmcoredd_system_state *system_state;
+
+	if (!custom_vmcore_note_ensure_ready())
 		return false;
 
-	end = start + size - 1;
-	return start <= res->end && end >= res->start;
+	system_state = custom_system_state_ptr();
+	if (!system_state)
+		return false;
+
+	memcpy(system_state, state, sizeof(*state));
+	return true;
 }
 
-static int __init custom_reserve_vmcore_note_buffer(void)
+static bool custom_vmcore_note_store_cpu_state(unsigned int cpu,
+	const struct custom_vmcoredd_cpu_state *state)
 {
-	if (!crashk_res.end || crashk_res.end <= crashk_res.start)
-		return 0;
+	struct custom_vmcoredd_cpu_state *cpu_state;
 
-	custom_vmcore_note = alloc_pages_exact(CUSTOM_CRASH_NOTE_BYTES,
-					      GFP_KERNEL | __GFP_ZERO);
-	if (!custom_vmcore_note) {
-		pr_warn("custom crashdump: failed to allocate vmcore note buffer\n");
-		return -ENOMEM;
-	}
+	if (!custom_vmcore_note_ensure_ready())
+		return false;
 
-	custom_vmcore_note_phys = virt_to_phys(custom_vmcore_note);
-	if (custom_range_overlaps_resource(custom_vmcore_note_phys,
-					   CUSTOM_CRASH_NOTE_BYTES,
-					   &crashk_res) ||
-		    custom_range_overlaps_resource(custom_vmcore_note_phys,
-					   CUSTOM_CRASH_NOTE_BYTES,
-					   &crashk_low_res)) {
-		pr_warn("custom crashdump: allocated vmcore note buffer overlaps crashkernel reservation\n");
-		free_pages_exact(custom_vmcore_note, CUSTOM_CRASH_NOTE_BYTES);
-		custom_vmcore_note = NULL;
-		custom_vmcore_note_phys = 0;
-		return -ENOMEM;
-	}
+	cpu_state = custom_cpu_state_ptr(cpu);
+	if (!cpu_state)
+		return false;
 
-	pr_info("custom crashdump: reserved vmcore note buffer at %pa size=%u\n",
-		&custom_vmcore_note_phys, CUSTOM_CRASH_NOTE_BYTES);
-
-	return 0;
+	memcpy(cpu_state, state, sizeof(*state));
+	return true;
 }
-early_initcall(custom_reserve_vmcore_note_buffer);
+
+static bool custom_vmcore_note_store_msr_state(unsigned int cpu,
+	const struct custom_vmcoredd_msr_state *state)
+{
+	struct custom_vmcoredd_msr_state *msr_state;
+
+	if (!custom_vmcore_note_ensure_ready())
+		return false;
+
+	msr_state = custom_msr_state_ptr(cpu);
+	if (!msr_state)
+		return false;
+
+	memcpy(msr_state, state, sizeof(*state));
+	return true;
+}
+
+static bool custom_vmcore_note_store_apic_state(unsigned int cpu,
+	const struct custom_vmcoredd_apic_state *state)
+{
+	struct custom_vmcoredd_apic_state *apic_state;
+
+	if (!custom_vmcore_note_ensure_ready())
+		return false;
+
+	apic_state = custom_apic_state_ptr(cpu);
+	if (!apic_state)
+		return false;
+
+	memcpy(apic_state, state, sizeof(*state));
+	return true;
+}
+
+static bool custom_vmcore_note_store_context(unsigned int cpu,
+	unsigned int context_index,
+	const struct custom_vmcoredd_context_state *state)
+{
+	struct custom_vmcoredd_context_state *context_state;
+
+	if (!custom_vmcore_note_ensure_ready())
+		return false;
+
+	context_state = custom_context_state_ptr(cpu, context_index);
+	if (!context_state)
+		return false;
+
+	memcpy(context_state, state, sizeof(*state));
+	return true;
+}
+
+static unsigned int custom_capture_section_count(void)
+{
+	return CUSTOM_FIXED_SECTION_COUNT;
+}
+
+static phys_addr_t custom_vmcore_note_paddr(void)
+{
+	return __pa_symbol(&custom_vmcore_note);
+}
+
+static phys_addr_t custom_vmcore_note_desc_paddr(void)
+{
+	return custom_vmcore_note_paddr() +
+		offsetof(struct custom_vmcoredd_note_layout, prefix.header);
+}
 
 static __always_inline u64 custom_read_cr8(void)
 {
@@ -615,19 +863,22 @@ static unsigned int custom_first_valid_cpu(void)
 	unsigned int index;
 
 	for (index = 0; index < CUSTOM_MAX_CAPTURE_CPUS; index++) {
-		if (custom_cpu_states[index].valid)
+		struct custom_vmcoredd_cpu_state *state = custom_cpu_state_ptr(index);
+
+		if (state && state->valid)
 			return index;
 	}
 
 	return CUSTOM_MAX_CAPTURE_CPUS;
 }
 
-static void custom_collect_cpu_state(struct custom_vmcoredd_cpu_state *state)
+static void custom_collect_cpu_state(struct custom_vmcoredd_cpu_state *state,
+				      u32 cpu_id)
 {
 	u64 value;
 
 	memset(state, 0, sizeof(*state));
-	state->cpu_id = raw_smp_processor_id();
+	state->cpu_id = cpu_id;
 	state->valid = 1;
 	state->tsc = rdtsc();
 	state->cr0 = read_cr0();
@@ -721,11 +972,12 @@ static void custom_capture_stack_snapshot(struct custom_vmcoredd_context_state *
 }
 
 static void custom_fill_context_from_regs(struct custom_vmcoredd_context_state *state,
-				     const struct pt_regs *regs, u32 source,
-				     u32 trap_nr, u32 signr)
+					  u32 cpu_id,
+					  const struct pt_regs *regs, u32 source,
+					  u32 trap_nr, u32 signr)
 {
 	memset(state, 0, sizeof(*state));
-	state->cpu_id = raw_smp_processor_id();
+	state->cpu_id = cpu_id;
 	state->source = source;
 	state->trap_nr = trap_nr;
 	state->signr = signr;
@@ -758,14 +1010,14 @@ static void custom_fill_context_from_regs(struct custom_vmcoredd_context_state *
 }
 
 static void custom_collect_fpu_state(struct custom_vmcoredd_fpu_state *state,
-				 bool live)
+				     u32 cpu_id, bool live)
 {
 	struct fpu *fpu = x86_task_fpu(current);
 	const struct fpstate *fpstate;
 	u32 area_size;
 
 	memset(state, 0, sizeof(*state));
-	state->cpu_id = raw_smp_processor_id();
+	state->cpu_id = cpu_id;
 	if (!fpu || !fpu->fpstate)
 		fpstate = &init_fpstate;
 	else
@@ -787,12 +1039,13 @@ static void custom_collect_fpu_state(struct custom_vmcoredd_fpu_state *state,
 		fpregs_unlock();
 }
 
-static void custom_collect_msr_state(struct custom_vmcoredd_msr_state *state)
+static void custom_collect_msr_state(struct custom_vmcoredd_msr_state *state,
+				     u32 cpu_id)
 {
 	unsigned int index;
 
 	memset(state, 0, sizeof(*state));
-	state->cpu_id = raw_smp_processor_id();
+	state->cpu_id = cpu_id;
 	state->entry_count = CUSTOM_MSR_ENTRY_COUNT;
 	for (index = 0; index < CUSTOM_MSR_ENTRY_COUNT; index++) {
 		state->entries[index].msr = custom_tracked_msrs[index];
@@ -802,12 +1055,13 @@ static void custom_collect_msr_state(struct custom_vmcoredd_msr_state *state)
 	}
 }
 
-static void custom_collect_apic_state(struct custom_vmcoredd_apic_state *state)
+static void custom_collect_apic_state(struct custom_vmcoredd_apic_state *state,
+				      u32 cpu_id)
 {
 	unsigned int index;
 
 	memset(state, 0, sizeof(*state));
-	state->cpu_id = raw_smp_processor_id();
+	state->cpu_id = cpu_id;
 	if (!boot_cpu_has(X86_FEATURE_APIC))
 		return;
 
@@ -838,31 +1092,51 @@ static void custom_collect_apic_state(struct custom_vmcoredd_apic_state *state)
 
 static void custom_collect_cpu_bundle(u32 cpu, bool live_fpu)
 {
+	struct custom_vmcoredd_cpu_state cpu_state;
+	struct custom_vmcoredd_msr_state msr_state;
+	struct custom_vmcoredd_apic_state apic_state;
+	struct custom_vmcoredd_fpu_state *fpu_state;
+	struct fpu *fpu = x86_task_fpu(current);
+	const struct fpstate *fpstate;
+	u32 fpu_area_size;
+
 	if (cpu >= CUSTOM_MAX_CAPTURE_CPUS)
 		return;
 
-	custom_collect_cpu_state(&custom_cpu_states[cpu]);
-	custom_collect_fpu_state(&custom_fpu_states[cpu], live_fpu);
-	custom_collect_msr_state(&custom_msr_states[cpu]);
-	custom_collect_apic_state(&custom_apic_states[cpu]);
+	custom_collect_cpu_state(&cpu_state, cpu);
+	if (!custom_vmcore_note_store_cpu_state(cpu, &cpu_state))
+		return;
+
+	if (!fpu || !fpu->fpstate)
+		fpstate = &init_fpstate;
+	else
+		fpstate = fpu->fpstate;
+	fpu_area_size = min_t(u32, fpstate->size ?: fpu_kernel_cfg.default_size,
+			      CUSTOM_MAX_XSAVE_AREA_SIZE);
+	fpu_state = custom_fpu_state_ptr(cpu);
+	if (fpu_state)
+		custom_collect_fpu_state(fpu_state, cpu, live_fpu);
+
+	custom_collect_msr_state(&msr_state, cpu);
+	if (!custom_vmcore_note_store_msr_state(cpu, &msr_state))
+		return;
+
+	custom_collect_apic_state(&apic_state, cpu);
+	if (apic_state.valid &&
+	    !custom_vmcore_note_store_apic_state(cpu, &apic_state))
+			return;
 }
 
 static unsigned int custom_context_index(u32 source)
 {
-	switch (source) {
-	case CUSTOM_CONTEXT_SOURCE_TASK:
-		return CUSTOM_CONTEXT_INDEX_TASK;
-	case CUSTOM_CONTEXT_SOURCE_IRQ:
-		return CUSTOM_CONTEXT_INDEX_IRQ;
-	case CUSTOM_CONTEXT_SOURCE_NMI:
-		return CUSTOM_CONTEXT_INDEX_NMI;
-	case CUSTOM_CONTEXT_SOURCE_EXCEPTION:
-		return CUSTOM_CONTEXT_INDEX_EXC;
-	case CUSTOM_CONTEXT_SOURCE_PANIC:
-		return CUSTOM_CONTEXT_INDEX_PANIC;
-	default:
-		return CUSTOM_CONTEXT_INDEX_EXC;
-	}
+	/*
+	 * TASK=1→0, IRQ=2→1, NMI=3→2, EXCEPTION=4→3.
+	 * Out-of-range values fall back to the EXC slot.
+	 */
+	if (source >= CUSTOM_CONTEXT_SOURCE_TASK &&
+	    source <= CUSTOM_CONTEXT_SOURCE_EXCEPTION)
+		return source - CUSTOM_CONTEXT_SOURCE_TASK;
+	return CUSTOM_CONTEXT_INDEX_EXC;
 }
 
 static unsigned int custom_count_valid_cpu_slots(void)
@@ -871,7 +1145,9 @@ static unsigned int custom_count_valid_cpu_slots(void)
 	unsigned int index;
 
 	for (index = 0; index < CUSTOM_MAX_CAPTURE_CPUS; index++) {
-		if (custom_cpu_states[index].valid)
+		struct custom_vmcoredd_cpu_state *state = custom_cpu_state_ptr(index);
+
+		if (state && state->valid)
 			count++;
 	}
 
@@ -886,7 +1162,10 @@ static unsigned int custom_count_context_valid(void)
 
 	for (cpu_index = 0; cpu_index < CUSTOM_MAX_CAPTURE_CPUS; cpu_index++) {
 		for (ctx_index = 0; ctx_index < CUSTOM_MAX_CONTEXTS_PER_CPU; ctx_index++) {
-			if (custom_cpu_contexts[cpu_index][ctx_index].valid)
+			struct custom_vmcoredd_context_state *state =
+				custom_context_state_ptr(cpu_index, ctx_index);
+
+			if (state && state->valid)
 				count++;
 		}
 	}
@@ -897,7 +1176,7 @@ static unsigned int custom_count_context_valid(void)
 void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source)
 {
 	const struct pt_regs *irq_regs;
-	struct custom_vmcoredd_context_state *contexts;
+	struct custom_vmcoredd_context_state context;
 	bool live_fpu;
 	unsigned int index;
 
@@ -906,51 +1185,23 @@ void custom_crashdump_save_cpu(struct pt_regs *regs, int cpu, u32 source)
 
 	live_fpu = source != CUSTOM_CONTEXT_SOURCE_NMI;
 	custom_collect_cpu_bundle(cpu, live_fpu);
-	contexts = custom_cpu_contexts[cpu];
 
-	custom_fill_context_from_regs(&contexts[CUSTOM_CONTEXT_INDEX_TASK],
-				     task_pt_regs(current), CUSTOM_CONTEXT_SOURCE_TASK,
-				     0, 0);
+	custom_fill_context_from_regs(&context, cpu,
+				      task_pt_regs(current),
+				      CUSTOM_CONTEXT_SOURCE_TASK, 0, 0);
+	custom_vmcore_note_store_context(cpu, CUSTOM_CONTEXT_INDEX_TASK, &context);
 
 	irq_regs = get_irq_regs();
-	custom_fill_context_from_regs(&contexts[CUSTOM_CONTEXT_INDEX_IRQ],
-				     irq_regs, CUSTOM_CONTEXT_SOURCE_IRQ, 0, 0);
+	custom_fill_context_from_regs(&context, cpu,
+				      irq_regs, CUSTOM_CONTEXT_SOURCE_IRQ, 0, 0);
+	custom_vmcore_note_store_context(cpu, CUSTOM_CONTEXT_INDEX_IRQ, &context);
 
 	index = custom_context_index(source);
-	custom_fill_context_from_regs(&contexts[index], regs, source,
-				     source == CUSTOM_CONTEXT_SOURCE_EXCEPTION ?
-				     current->thread.trap_nr : 0,
-				     0);
-	if (!regs && index == CUSTOM_CONTEXT_INDEX_EXC)
-		contexts[index].cpu_id = cpu;
-	if (cpu != raw_smp_processor_id()) {
-		custom_cpu_states[cpu].cpu_id = cpu;
-		custom_fpu_states[cpu].cpu_id = cpu;
-		custom_msr_states[cpu].cpu_id = cpu;
-		custom_apic_states[cpu].cpu_id = cpu;
-		for (index = 0; index < CUSTOM_MAX_CONTEXTS_PER_CPU; index++)
-			contexts[index].cpu_id = cpu;
-	}
-}
-
-static u8 *custom_note_append_section(u8 *cursor, const u8 *limit, u32 type,
-				      const void *data, u32 size, u32 *section_count)
-{
-	struct custom_vmcoredd_section *section = (struct custom_vmcoredd_section *)cursor;
-	u32 aligned_size = ALIGN(size, 4);
-
-	if (cursor + sizeof(*section) + aligned_size > limit)
-		return NULL;
-
-	section->type = type;
-	section->size = size;
-	cursor += sizeof(*section);
-	memcpy(cursor, data, size);
-	if (aligned_size > size)
-		memset(cursor + size, 0, aligned_size - size);
-	(*section_count)++;
-
-	return cursor + aligned_size;
+	custom_fill_context_from_regs(&context, cpu, regs, source,
+				      source == CUSTOM_CONTEXT_SOURCE_EXCEPTION ?
+				      current->thread.trap_nr : 0,
+				      0);
+	custom_vmcore_note_store_context(cpu, index, &context);
 }
 
 /*
@@ -972,25 +1223,24 @@ static u32 custom_device_section_size(const struct custom_device_desc *desc)
  * Write one DEVICE_STATE section directly into the PT_NOTE buffer.
  * Reads are performed using cached virtual addresses; no ioremap at panic.
  */
-static u8 *custom_note_append_device(u8 *cursor, const u8 *limit,
-				     const struct custom_device_runtime *dev,
-				     u32 *section_count)
+static bool custom_note_store_device(unsigned int device_index,
+				     const struct custom_device_runtime *dev)
 {
 	const struct custom_device_desc *desc = dev->desc;
-	struct custom_vmcoredd_section *sec;
 	struct custom_vmcoredd_device_header *dh;
+	struct custom_vmcoredd_region_header *rh;
+	u8 *cursor;
 	u32 data_size = custom_device_section_size(desc);
 	u32 i, j;
 
-	if (cursor + sizeof(*sec) + data_size > limit)
-		return NULL;
+	if (device_index >= CUSTOM_MAX_TEST_DEVICES)
+		return false;
+	if (data_size > sizeof(custom_vmcore_note.device[device_index].data))
+		return custom_vmcore_note_mark_overflow();
 
-	sec = (struct custom_vmcoredd_section *)cursor;
-	sec->type = CUSTOM_SECTION_DEVICE_STATE;
-	sec->size = data_size;
-	cursor += sizeof(*sec);
-
-	dh = (struct custom_vmcoredd_device_header *)cursor;
+	memset(custom_vmcore_note.device[device_index].data, 0,
+	       sizeof(custom_vmcore_note.device[device_index].data));
+	dh = custom_device_state_ptr(device_index);
 	dh->vendor_id      = dev->pdev ? dev->pdev->vendor : 0;
 	dh->device_id      = dev->pdev ? dev->pdev->device : 0;
 	dh->domain         = dev->pdev ? pci_domain_nr(dev->pdev->bus) : 0;
@@ -998,11 +1248,10 @@ static u8 *custom_note_append_device(u8 *cursor, const u8 *limit,
 					   dev->pdev->devfn) : 0;
 	dh->class_revision = dev->pdev ? dev->pdev->class : 0;
 	dh->region_count   = desc->region_count;
-	cursor += sizeof(*dh);
+	cursor = custom_vmcore_note.device[device_index].data + sizeof(*dh);
 
 	for (i = 0; i < desc->region_count; i++) {
 		const struct custom_region_desc *rd = &desc->regions[i];
-		struct custom_vmcoredd_region_header *rh;
 		u32 *data;
 		u32 nwords = rd->size / sizeof(u32);
 
@@ -1065,58 +1314,66 @@ static u8 *custom_note_append_device(u8 *cursor, const u8 *limit,
 		cursor += rd->size;
 	}
 
-	(*section_count)++;
-	return cursor;
-}
-
-static u32 custom_context_section_size(const struct custom_vmcoredd_context_state *state)
-{
-	return offsetof(struct custom_vmcoredd_context_state, stack_snapshot) +
-		state->stack_len;
-}
-
-static u32 custom_fpu_section_size(const struct custom_vmcoredd_fpu_state *state)
-{
-	return offsetof(struct custom_vmcoredd_fpu_state, xsave_area) +
-		state->area_size;
+	return true;
 }
 
 void custom_crashdump_capture(void)
 {
-	if (!custom_cpu_states[raw_smp_processor_id()].valid)
+	struct custom_vmcoredd_cpu_state *state;
+	struct custom_vmcoredd_system_state *system_state;
+	struct custom_vmcoredd_system_state current_system_state;
+
+	state = custom_cpu_state_ptr(raw_smp_processor_id());
+	if (!state || !state->valid)
 		custom_crashdump_save_cpu(NULL, raw_smp_processor_id(),
 					 CUSTOM_CONTEXT_SOURCE_EXCEPTION);
 
-	if (!custom_vmcore_note)
-		return;
-
-	custom_collect_system_state(&custom_last_system_state);
+	system_state = custom_system_state_ptr();
+	custom_collect_system_state(&current_system_state);
+	if (system_state)
+		custom_vmcore_note_store_system_state(&current_system_state);
 	custom_vmcore_note_prepare();
 }
 
 static void custom_vmcoreinfo_extra_append(void)
 {
 	struct custom_vmcoredd_header *hdr;
+	struct custom_vmcoredd_system_state *system_state;
+	struct custom_vmcoredd_cpu_state *cpu_state;
+	phys_addr_t note_desc_paddr;
 	unsigned int cpu;
 
 	if (!custom_vmcore_note_size)
 		return;
 
-	hdr = custom_vmcore_note_desc(custom_vmcore_note);
+	hdr = custom_vmcore_note_desc();
+	note_desc_paddr = custom_vmcore_note_desc_paddr();
 
 	vmcoreinfo_append_str("CUSTOM_NOTE_NAME=%s\n", CUSTOM_CRASH_NOTE_NAME);
 	vmcoreinfo_append_str("CUSTOM_NOTE_TYPE=0x%x\n", CUSTOM_CRASH_NOTE_TYPE);
+	vmcoreinfo_append_str("CUSTOM_NOTE_PADDR=0x%llx\n",
+			     (unsigned long long)custom_vmcore_note_paddr());
+	vmcoreinfo_append_str("CUSTOM_NOTE_DESC_PADDR=0x%llx\n",
+			     (unsigned long long)note_desc_paddr);
+	vmcoreinfo_append_str("CUSTOM_NOTE_RESERVED_SIZE=%u\n",
+			     CUSTOM_CRASH_NOTE_BYTES);
 	vmcoreinfo_append_str("CUSTOM_NOTE_SIZE=%zu\n", custom_vmcore_note_size);
+	vmcoreinfo_append_str("CUSTOM_NOTE_DESC_SIZE=%u\n", hdr->total_size);
+	vmcoreinfo_append_str("CUSTOM_NOTE_MAGIC=0x%x\n", hdr->magic);
+	vmcoreinfo_append_str("CUSTOM_NOTE_VERSION=%u\n", hdr->version);
 	vmcoreinfo_append_str("CUSTOM_SECTION_COUNT=%u\n", hdr->section_count);
 	vmcoreinfo_append_str("CUSTOM_DEVICE_COUNT=%u\n", custom_runtime_device_count);
 	vmcoreinfo_append_str("CUSTOM_CPU_COUNT=%u\n", custom_count_valid_cpu_slots());
 	vmcoreinfo_append_str("CUSTOM_CONTEXT_COUNT=%u\n", custom_count_context_valid());
+	system_state = custom_system_state_ptr();
 	cpu = custom_first_valid_cpu();
 	if (cpu < CUSTOM_MAX_CAPTURE_CPUS) {
-		vmcoreinfo_append_str("CUSTOM_CPU_ID=%u\n", custom_cpu_states[cpu].cpu_id);
-		vmcoreinfo_append_str("CUSTOM_CPU_CR3=0x%llx\n", custom_cpu_states[cpu].cr3);
+		cpu_state = custom_cpu_state_ptr(cpu);
+		vmcoreinfo_append_str("CUSTOM_CPU_ID=%u\n", cpu_state->cpu_id);
+		vmcoreinfo_append_str("CUSTOM_CPU_CR3=0x%llx\n", cpu_state->cr3);
 	}
-	vmcoreinfo_append_str("CUSTOM_JIFFIES=0x%llx\n", custom_last_system_state.jiffies);
+	if (system_state)
+		vmcoreinfo_append_str("CUSTOM_JIFFIES=0x%llx\n", system_state->jiffies);
 }
 
 void arch_crash_save_vmcoreinfo_late(void)
@@ -1126,127 +1383,52 @@ void arch_crash_save_vmcoreinfo_late(void)
 
 static void custom_vmcore_note_prepare(void)
 {
-	void *note_buf = custom_vmcore_note;
-	struct elf_note *note = (struct elf_note *)note_buf;
-	struct custom_vmcoredd_header *hdr = custom_vmcore_note_desc(note_buf);
-	const u8 *limit = (u8 *)custom_vmcore_note + CUSTOM_CRASH_NOTE_BYTES -
-		sizeof(struct elf_note);
-	u8 *cursor = (u8 *)(hdr + 1);
-	void *tail_note;
+	struct elf_note *note = custom_vmcore_note_header();
+	struct custom_vmcoredd_header *hdr = custom_vmcore_note_desc();
 	unsigned int device_index;
-	unsigned int cpu_index;
-	unsigned int ctx_index;
 
-	if (!note_buf) {
-		custom_vmcore_note_size = 0;
-		pr_warn_once("custom crashdump: vmcore note buffer is unavailable\n");
-		return;
-	}
-
-	memset(note_buf, 0, CUSTOM_CRASH_NOTE_BYTES);
-
-	hdr->magic = CUSTOM_VMCOREDD_MAGIC;
-	hdr->version = CUSTOM_VMCOREDD_VERSION;
-	hdr->section_count = 0;
-	hdr->flags = 0;
-	hdr->reserved0 = 0;
-	hdr->reserved1 = 0;
-
-	cursor = custom_note_append_section(cursor, limit, CUSTOM_SECTION_SYSTEM_STATE,
-					   &custom_last_system_state,
-					   sizeof(custom_last_system_state),
-					   &hdr->section_count);
-	if (!cursor)
+	if (!custom_vmcore_note_ensure_ready())
 		goto overflow;
 
-	for (cpu_index = 0; cpu_index < CUSTOM_MAX_CAPTURE_CPUS; cpu_index++) {
-		if (!custom_cpu_states[cpu_index].valid)
-			continue;
-
-		cursor = custom_note_append_section(cursor, limit, CUSTOM_SECTION_CPU_STATE,
-					   &custom_cpu_states[cpu_index],
-					   sizeof(custom_cpu_states[cpu_index]),
-					   &hdr->section_count);
-		if (!cursor)
-			goto overflow;
-
-		for (ctx_index = 0; ctx_index < CUSTOM_MAX_CONTEXTS_PER_CPU; ctx_index++) {
-			if (!custom_cpu_contexts[cpu_index][ctx_index].valid)
-				continue;
-			cursor = custom_note_append_section(cursor, limit,
-						   CUSTOM_SECTION_CONTEXT_STATE,
-						   &custom_cpu_contexts[cpu_index][ctx_index],
-					   custom_context_section_size(&custom_cpu_contexts[cpu_index][ctx_index]),
-						   &hdr->section_count);
-			if (!cursor)
-				goto overflow;
-		}
-
-		if (custom_fpu_states[cpu_index].valid) {
-			cursor = custom_note_append_section(cursor, limit,
-						   CUSTOM_SECTION_FPU_STATE,
-						   &custom_fpu_states[cpu_index],
-					   custom_fpu_section_size(&custom_fpu_states[cpu_index]),
-						   &hdr->section_count);
-			if (!cursor)
-				goto overflow;
-		}
-
-		cursor = custom_note_append_section(cursor, limit, CUSTOM_SECTION_MSR_STATE,
-					   &custom_msr_states[cpu_index],
-					   sizeof(custom_msr_states[cpu_index]),
-					   &hdr->section_count);
-		if (!cursor)
-			goto overflow;
-
-		if (custom_apic_states[cpu_index].valid) {
-			cursor = custom_note_append_section(cursor, limit,
-						   CUSTOM_SECTION_APIC_STATE,
-						   &custom_apic_states[cpu_index],
-						   sizeof(custom_apic_states[cpu_index]),
-						   &hdr->section_count);
-			if (!cursor)
-				goto overflow;
-		}
-	}
+	hdr->section_count = custom_capture_section_count();
 
 	for (device_index = 0; device_index < custom_runtime_device_count; device_index++) {
-		cursor = custom_note_append_device(cursor, limit,
-						   &custom_runtime_devices[device_index],
-						   &hdr->section_count);
-		if (!cursor)
+		if (!custom_note_store_device(device_index,
+					    &custom_runtime_devices[device_index]))
 			goto overflow;
 	}
 
-	hdr->total_size = cursor - (u8 *)hdr;
+	hdr->total_size = offsetof(struct custom_vmcoredd_note_layout, tail) -
+		offsetof(struct custom_vmcoredd_note_layout, prefix.header);
 	hdr->payload_crc = 0;
-	hdr->payload_crc = crc32_le(0, (u8 *)(hdr + 1), hdr->total_size - sizeof(*hdr));
+	hdr->payload_crc = crc32_le(0, (u8 *)&custom_vmcore_note.system,
+				    hdr->total_size - sizeof(*hdr));
 
 	note->n_namesz = sizeof(CUSTOM_CRASH_NOTE_NAME);
 	note->n_descsz = hdr->total_size;
 	note->n_type = CUSTOM_CRASH_NOTE_TYPE;
-	memcpy((u8 *)note_buf + sizeof(*note), CUSTOM_CRASH_NOTE_NAME,
+	memcpy(custom_vmcore_note.prefix.name, CUSTOM_CRASH_NOTE_NAME,
 	       sizeof(CUSTOM_CRASH_NOTE_NAME));
-	tail_note = (u8 *)hdr + ALIGN(hdr->total_size, 4);
-	final_note(tail_note);
-	custom_vmcore_note_size = (u8 *)tail_note + sizeof(struct elf_note) -
-		(u8 *)note_buf;
+	final_note((Elf64_Word *)&custom_vmcore_note.tail);
+	custom_vmcore_note_size = offsetof(struct custom_vmcoredd_note_layout, tail) +
+		sizeof(struct elf_note);
 
 	pr_info("custom crashdump: vmcore note prepared size=%zu devices=%u sections=%u\n",
 		custom_vmcore_note_size, custom_runtime_device_count, hdr->section_count);
 	return;
 
 overflow:
+	atomic_set(&custom_capture_state, CUSTOM_CAPTURE_OVERFLOW);
 	custom_vmcore_note_size = 0;
 	pr_warn("custom crashdump: vmcore note buffer exhausted\n");
 }
 
 phys_addr_t custom_crash_note_paddr(void)
 {
-	return custom_vmcore_note_phys;
+	return custom_vmcore_note_paddr();
 }
 
 size_t custom_crash_note_reserved_size(void)
 {
-	return custom_vmcore_note ? CUSTOM_CRASH_NOTE_BYTES : 0;
+	return CUSTOM_CRASH_NOTE_BYTES;
 }
